@@ -9,13 +9,13 @@ int Log::append(const std::string &message)
 {
     std::string length = std::to_string(message.size());
     char deliminator = ',';
-    for (int i = 0; i < length.size(); i++) {
+    for (size_t i = 0; i < length.size(); i++) {
         mem[offset + i] = length[i];
     }
     offset += length.size();
-    mem[++offset] = deliminator;
+    mem[offset++] = deliminator;
 
-    for (int i = 0; i < message.size(); i++) {
+    for (size_t i = 0; i < message.size(); i++) {
         mem[offset + i] = message[i];
     }
     offset += message.size();
@@ -30,6 +30,16 @@ int Log::append(const std::string &message)
     return offset;
 }
 
-std::string read(int givenOffset)
+std::string Log::read(int givenOffset)
 {
+    std::string length = "";
+    std::string res = "";
+    while (givenOffset < offset && mem[givenOffset] != ',') {
+        length += mem[givenOffset++];
+    }
+    givenOffset++;
+    for (int i = 0; i < stoi(length); i++) {
+        res += mem[givenOffset + i];
+    }
+    return res;
 }
