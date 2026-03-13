@@ -5,6 +5,14 @@ Log::Log() {
 }
 
 int Log::append(const std::string &message) {
+    std::string length = std::to_string(message.size());
+    char deliminator = ',';
+    for (int i = 0; i < length.size(); i++) {
+        mem[offset + i] = length[i];
+    }
+    offset += length.size();
+    mem[++offset] = deliminator;
+
     for (int i = 0; i < message.size(); i++) {
         mem[offset + i] = message[i];
     }
@@ -15,7 +23,10 @@ int Log::append(const std::string &message) {
         std::cerr << "Can't open file" << std::endl;
         return -1;
     }
-    file << message;
+    file << length << deliminator << message;
     file.close();
     return offset;
+}
+
+std::string read(int givenOffset) {
 }
