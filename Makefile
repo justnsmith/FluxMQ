@@ -21,4 +21,13 @@ run: $(TARGET)
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: run clean
+lint:
+	./scripts/lint.sh
+
+format:
+	./scripts/format.sh
+
+format-check:
+	./scripts/format.sh --check
+
+.PHONY: run clean lint format format-check

@@ -1,10 +1,12 @@
 #include "log.h"
 
-Log::Log() {
+Log::Log()
+{
     // readFromDisk(dir_path);
 }
 
-int Log::append(const std::string &message) {
+int Log::append(const std::string &message)
+{
     std::string length = std::to_string(message.size());
     char deliminator = ',';
     for (int i = 0; i < length.size(); i++) {
@@ -28,5 +30,6 @@ int Log::append(const std::string &message) {
     return offset;
 }
 
-std::string read(int givenOffset) {
+std::string read(int givenOffset)
+{
 }

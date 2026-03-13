@@ -3,7 +3,8 @@
 #include <iostream>
 #include <string>
 
-class Log {
+class Log
+{
   private:
     std::array<char, 2048> mem{};
     int offset{};
