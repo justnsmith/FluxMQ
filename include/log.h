@@ -1,4 +1,5 @@
 #include <array>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -8,9 +9,9 @@ class Log
   private:
     std::array<char, 2048> mem{};
     int offset{};
-    std::string dir_path = "data/mem.txt";
+    std::string dir_path = "data/mem.bin";
 
-    void readFromDisk(const std::string &path);
+    void readFromDisk();
 
   public:
     Log();

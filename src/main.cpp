@@ -4,7 +4,7 @@
 int main()
 {
     Log log{};
-    std::cout << log.append("test") << std::endl;
-    std::cout << log.append("blah") << std::endl;
-    std::cout << "Test: " << log.read(6) << std::endl;
+    std::cout << log.append("testing") << std::endl;
+    std::cout << log.append("justin") << std::endl;
+    std::cout << "TEST: " << log.read(11) << std::endl;
 }
