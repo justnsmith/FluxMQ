@@ -17,15 +17,15 @@ int Log::append(const std::string &message)
     }
 
     // First 4 bytes written are the N bytes of the message size
+    index_[next_offset_] = curr_byte_pos;
     file.write(reinterpret_cast<const char *>(&length), sizeof(uint32_t));
     file.write(message.data(), length);
     file.close();
-    int msg_offset = offset;
-    offset += sizeof(uint32_t) + length;
-    return msg_offset;
+    curr_byte_pos += sizeof(uint32_t) + length;
+    return next_offset_++;
 }
 
-std::string Log::read(int givenOffset)
+std::string Log::read(uint64_t offset)
 {
     uint32_t length;
     std::string message = "";
@@ -35,7 +35,10 @@ std::string Log::read(int givenOffset)
         std::cerr << "Can't open file" << std::endl;
         return "";
     }
-    file.seekg(givenOffset);
+    auto it = index_.find(offset);
+    if (it == index_.end())
+        return "";
+    file.seekg(it->second);
     file.read(reinterpret_cast<char *>(&length), sizeof(length));
     if (file.fail()) {
         return "";
@@ -47,21 +50,31 @@ std::string Log::read(int givenOffset)
 
 void Log::readFromDisk()
 {
-    int readOffset = 0;
-    std::string currentMessage;
-    while (!(currentMessage = read(readOffset)).empty()) {
-        uint32_t length = static_cast<uint32_t>(currentMessage.size());
+    std::ifstream file;
+    file.open(dir_path, std::ios::binary);
+    if (!file) {
+        return;
+    }
+
+    uint32_t length;
+    while (file.read(reinterpret_cast<char *>(&length), sizeof(length))) {
         int needed = static_cast<int>(sizeof(uint32_t)) + static_cast<int>(length);
-        if (offset + needed > static_cast<int>(mem.size())) {
+        if (curr_byte_pos + static_cast<uint64_t>(needed) > mem.size()) {
             break;
         }
+        index_[next_offset_] = curr_byte_pos;
         const char *lenBytes = reinterpret_cast<const char *>(&length);
         for (size_t i = 0; i < sizeof(uint32_t); i++) {
-            mem[offset++] = lenBytes[i];
+            mem[curr_byte_pos++] = lenBytes[i];
+        }
+        std::string message(length, '\0');
+        file.read(message.data(), length);
+        if (file.fail()) {
+            break;
         }
         for (size_t i = 0; i < length; i++) {
-            mem[offset++] = currentMessage[i];
+            mem[curr_byte_pos++] = message[i];
         }
-        readOffset += needed;
+        next_offset_++;
     }
 }
