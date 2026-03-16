@@ -1,4 +1,3 @@
-#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -8,7 +7,6 @@
 class Log
 {
   private:
-    std::array<char, 2048> mem{};
     std::unordered_map<uint64_t, uint64_t> index_;
     std::string dir_path = "data/mem.bin";
     uint64_t next_offset_{};

@@ -2,7 +2,7 @@
 
 Log::Log()
 {
-    // readFromDisk();
+    readFromDisk();
 }
 
 int Log::append(const std::string &message)
@@ -58,23 +58,12 @@ void Log::readFromDisk()
 
     uint32_t length;
     while (file.read(reinterpret_cast<char *>(&length), sizeof(length))) {
-        int needed = static_cast<int>(sizeof(uint32_t)) + static_cast<int>(length);
-        if (curr_byte_pos + static_cast<uint64_t>(needed) > mem.size()) {
-            break;
-        }
         index_[next_offset_] = curr_byte_pos;
-        const char *lenBytes = reinterpret_cast<const char *>(&length);
-        for (size_t i = 0; i < sizeof(uint32_t); i++) {
-            mem[curr_byte_pos++] = lenBytes[i];
-        }
-        std::string message(length, '\0');
-        file.read(message.data(), length);
+        curr_byte_pos += sizeof(uint32_t) + length;
+        next_offset_++;
+        file.seekg(length, std::ios::cur);
         if (file.fail()) {
             break;
         }
-        for (size_t i = 0; i < length; i++) {
-            mem[curr_byte_pos++] = message[i];
-        }
-        next_offset_++;
     }
 }
