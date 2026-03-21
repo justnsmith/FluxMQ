@@ -279,8 +279,17 @@ void ReplicationManager::FollowerLoop(std::string topic, int32_t partition)
             }
         }
 
-        // Determine our current fetch offset.
+        // Ensure the topic exists locally (it may have been created on another broker).
         Topic *t = tm_.FindTopic(topic);
+        if (!t) {
+            // Determine partition count from the cluster store.
+            int max_part = asgn->partition;
+            for (const auto &a : cs_.AllAssignments())
+                if (a.topic == topic && a.partition > max_part)
+                    max_part = a.partition;
+            tm_.CreateTopic(topic, max_part + 1); // idempotent: ignores kTopicAlreadyExists
+            t = tm_.FindTopic(topic);
+        }
         if (!t) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;

@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <thread>
 
 using Clock = std::chrono::steady_clock;
@@ -278,11 +279,10 @@ void BrokerHandler::HandleMetadata(Connection &conn, const RequestFrame &frame)
     BinaryWriter w(body);
 
     if (frame.api_version >= 1 && cs_) {
-        // Extended v1 response:
-        // [4B num_brokers] per broker: [4B id][2B host][2B port]
-        // [4B num_topics] per topic: [2B name][4B num_parts]
-        //   per partition: [4B id][4B leader_id][4B leader_epoch]
-        //                  [4B num_replicas][4B...] [4B num_isr][4B...]
+        // Extended v1 response: derive the full cluster-wide topic list from
+        // the ClusterStore (which has assignments for ALL brokers, not just self).
+        // This ensures followers can answer MetadataV1 for topics they haven't
+        // yet created locally.
         auto brokers = cs_->GetBrokers();
         w.WriteU32(static_cast<uint32_t>(brokers.size()));
         for (const auto &b : brokers) {
@@ -290,22 +290,26 @@ void BrokerHandler::HandleMetadata(Connection &conn, const RequestFrame &frame)
             w.WriteString(b.host);
             w.WriteU16(b.port);
         }
-        w.WriteU32(static_cast<uint32_t>(topics.size()));
-        for (const auto &[name, np] : topics) {
+
+        // Group all assignments by topic name.
+        auto all_asgn = cs_->AllAssignments();
+        std::map<std::string, std::vector<PartitionAssignment>> by_topic;
+        for (const auto &a : all_asgn)
+            by_topic[a.topic].push_back(a);
+
+        w.WriteU32(static_cast<uint32_t>(by_topic.size()));
+        for (const auto &[name, parts] : by_topic) {
             w.WriteString(name);
-            w.WriteU32(static_cast<uint32_t>(np));
-            for (int p = 0; p < np; ++p) {
-                auto asgn = cs_->GetAssignment(name, p);
-                w.WriteI32(p);
-                w.WriteI32(asgn ? asgn->leader_id : cs_->SelfId());
-                w.WriteI32(asgn ? asgn->leader_epoch : 0);
-                auto replicas = asgn ? asgn->replicas : std::vector<int32_t>{cs_->SelfId()};
-                auto isr = asgn ? asgn->isr : std::vector<int32_t>{cs_->SelfId()};
-                w.WriteU32(static_cast<uint32_t>(replicas.size()));
-                for (int32_t r : replicas)
+            w.WriteU32(static_cast<uint32_t>(parts.size()));
+            for (const auto &asgn : parts) {
+                w.WriteI32(asgn.partition);
+                w.WriteI32(asgn.leader_id);
+                w.WriteI32(asgn.leader_epoch);
+                w.WriteU32(static_cast<uint32_t>(asgn.replicas.size()));
+                for (int32_t r : asgn.replicas)
                     w.WriteI32(r);
-                w.WriteU32(static_cast<uint32_t>(isr.size()));
-                for (int32_t r : isr)
+                w.WriteU32(static_cast<uint32_t>(asgn.isr.size()));
+                for (int32_t r : asgn.isr)
                     w.WriteI32(r);
             }
         }

@@ -285,6 +285,12 @@ std::vector<PartitionAssignment> ClusterStore::FollowerAssignments() const
     return result;
 }
 
+std::vector<PartitionAssignment> ClusterStore::AllAssignments() const
+{
+    std::shared_lock r(mu_);
+    return assignments_;
+}
+
 bool ClusterStore::IsLeader(std::string_view topic, int32_t partition) const
 {
     std::shared_lock r(mu_);

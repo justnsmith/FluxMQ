@@ -61,6 +61,7 @@ class ClusterStore
     std::optional<PartitionAssignment> GetAssignment(std::string_view topic, int32_t partition) const;
     std::vector<PartitionAssignment> LeaderAssignments() const;
     std::vector<PartitionAssignment> FollowerAssignments() const;
+    std::vector<PartitionAssignment> AllAssignments() const;
     bool IsLeader(std::string_view topic, int32_t partition) const;
     std::vector<BrokerInfo> GetBrokers() const;
 
