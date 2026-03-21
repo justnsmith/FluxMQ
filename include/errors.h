@@ -15,4 +15,7 @@ inline constexpr int16_t kTopicAlreadyExists = 36;
 inline constexpr int16_t kGroupNotFound = 16;
 inline constexpr int16_t kInvalidPartition = 10;
 inline constexpr int16_t kInvalidRequest = 42;
+inline constexpr int16_t kNotLeader = 6;          // request routed to wrong broker
+inline constexpr int16_t kFencedLeaderEpoch = 74; // stale leader epoch
+inline constexpr int16_t kBrokerNotAvailable = 8; // no leader elected yet
 } // namespace err

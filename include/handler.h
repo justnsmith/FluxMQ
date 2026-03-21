@@ -1,8 +1,10 @@
 #pragma once
 
+#include "cluster_store.h"
 #include "connection.h"
 #include "group_coordinator.h"
 #include "protocol.h"
+#include "replication_manager.h"
 #include "topic_manager.h"
 
 #include <atomic>
@@ -20,16 +22,19 @@ using PostFn = std::function<void(int fd, ResponseFrame resp)>;
 //
 // It is designed to be wrapped in a lambda and passed as the Server's RequestHandler:
 //
-//   BrokerHandler bh(tm, gc, post_fn);
+//   BrokerHandler bh(tm, gc, rm, cs, post_fn);
 //   Server server([&bh](Connection& c, RequestFrame f){ bh.Handle(c, f); });
 //
 // Long-poll FETCH requests that find no data at fetch_offset are registered in
 // pending_fetches_.  A background thread polls every ~10 ms and delivers
 // responses via post_fn when data arrives or the deadline passes.
+//
+// Pass nullptr for cs and rm to run in standalone (non-replicated) mode.
 class BrokerHandler
 {
   public:
-    BrokerHandler(TopicManager &tm, GroupCoordinator &gc, PostFn post_fn);
+    BrokerHandler(TopicManager &tm, GroupCoordinator &gc, PostFn post_fn, ClusterStore *cs = nullptr, ReplicationManager *rm = nullptr,
+                  int replication_factor = 1, std::chrono::milliseconds broker_timeout = std::chrono::milliseconds(15000));
     ~BrokerHandler();
 
     BrokerHandler(const BrokerHandler &) = delete;
@@ -51,6 +56,10 @@ class BrokerHandler
     void HandleOffsetFetch(Connection &conn, const RequestFrame &frame);
     void HandleLeaveGroup(Connection &conn, const RequestFrame &frame);
 
+    // Replication API handlers.
+    void HandleReplicaFetch(Connection &conn, const RequestFrame &frame);
+    void HandleLeaderEpoch(Connection &conn, const RequestFrame &frame);
+
     // Encode a FETCH response from a vector of records.
     static ResponseFrame BuildFetchResponse(uint32_t corr_id, const std::vector<Record> &records);
 
@@ -70,6 +79,10 @@ class BrokerHandler
     TopicManager &tm_;
     GroupCoordinator &gc_;
     PostFn post_fn_;
+    ClusterStore *cs_;       // null in standalone mode
+    ReplicationManager *rm_; // null in standalone mode
+    int replication_factor_;
+    std::chrono::milliseconds broker_timeout_;
 
     std::mutex pending_mu_;
     std::vector<PendingFetch> pending_fetches_;

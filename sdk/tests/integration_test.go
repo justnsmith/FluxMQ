@@ -637,6 +637,253 @@ func TestConsumerCrashRebalance(t *testing.T) {
 	}
 }
 
+// TestReplication starts a 2-broker cluster, produces messages to the leader,
+// waits for replication, kills the leader, and verifies the follower (now the
+// new leader) has all the data.
+func TestReplication(t *testing.T) {
+	if _, err := os.Stat(brokerBin); os.IsNotExist(err) {
+		t.Skip("broker binary not found")
+	}
+
+	clusterDir := t.TempDir()
+	dataDir1 := t.TempDir()
+	dataDir2 := t.TempDir()
+
+	port1 := getFreePort()
+	port2 := getFreePort()
+	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
+	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+
+	start := func(brokerID int, port uint16, dataDir string) (*exec.Cmd, func()) {
+		outFile, _ := os.CreateTemp("", "fluxmq-repl-*")
+		cmd := exec.Command(brokerBin,
+			fmt.Sprintf("--port=%d", port),
+			fmt.Sprintf("--data-dir=%s", dataDir),
+			fmt.Sprintf("--cluster-dir=%s", clusterDir),
+			"--broker-host=127.0.0.1",
+			fmt.Sprintf("--broker-id=%d", brokerID),
+			"--replication-factor=2",
+			"--replica-lag-ms=500",
+			"--broker-timeout-ms=4000",
+		)
+		cmd.Stdout = outFile
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start broker %d: %v", brokerID, err)
+		}
+		return cmd, func() {
+			cmd.Process.Kill()
+			cmd.Wait()
+			outFile.Close()
+			os.Remove(outFile.Name())
+		}
+	}
+
+	cmd1, cleanup1 := start(1, port1, dataDir1)
+	defer cleanup1()
+	cmd2, cleanup2 := start(2, port2, dataDir2)
+	defer cleanup2()
+
+	if err := waitForTCP(addr1, 10*time.Second); err != nil {
+		t.Fatalf("broker 1 not ready: %v", err)
+	}
+	if err := waitForTCP(addr2, 10*time.Second); err != nil {
+		t.Fatalf("broker 2 not ready: %v", err)
+	}
+
+	// Give brokers time to discover each other via the cluster dir.
+	time.Sleep(3 * time.Second)
+
+	// Connect via ClusterClient using broker 1 as seed.
+	cc, err := fluxmq.NewClusterClient(addr1)
+	if err != nil {
+		t.Fatalf("NewClusterClient: %v", err)
+	}
+	defer cc.Close()
+
+	// Create a topic with replication-factor=2.
+	client1, err := fluxmq.NewClient(addr1)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client1.Close()
+
+	topic := uniqueTopic("repl-test")
+	if err := client1.CreateTopic(topic, 1); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Wait for leader to be elected for partition 0.
+	if err := cc.WaitForLeader(topic, 1, 10*time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+
+	// Produce messages via ClusterClient.
+	const N = 10
+	for i := 0; i < N; i++ {
+		val := fmt.Sprintf("repl-msg-%d", i)
+		if _, _, err := cc.Produce(topic, 0, nil, []byte(val)); err != nil {
+			t.Fatalf("Produce[%d]: %v", i, err)
+		}
+	}
+
+	// Wait for replication to propagate to the follower.
+	time.Sleep(2 * time.Second)
+
+	// Kill broker 1 (the leader since it created the topic).
+	cmd1.Process.Kill()
+	cmd1.Wait()
+
+	// Wait for broker 2 to become the new leader.
+	if err := cc.WaitForLeader(topic, 1, 15*time.Second); err != nil {
+		t.Fatalf("new leader not elected: %v", err)
+	}
+
+	// Fetch from the new leader and verify all messages are present.
+	records, err := cc.Fetch(topic, 0, 0, 10*1024*1024, 2000)
+	if err != nil {
+		t.Fatalf("Fetch after failover: %v", err)
+	}
+	if len(records) != N {
+		t.Fatalf("expected %d records after failover, got %d", N, len(records))
+	}
+	for i, rec := range records {
+		expected := fmt.Sprintf("repl-msg-%d", i)
+		if string(rec.Value) != expected {
+			t.Errorf("record[%d]: expected %q, got %q", i, expected, rec.Value)
+		}
+	}
+
+	// Silence cmd2 linter — cleanup2 will kill it.
+	_ = cmd2
+}
+
+// TestFailover verifies that a ClusterProducer transparently retries to the
+// new leader after the original leader broker is killed.
+func TestFailover(t *testing.T) {
+	if _, err := os.Stat(brokerBin); os.IsNotExist(err) {
+		t.Skip("broker binary not found")
+	}
+
+	clusterDir := t.TempDir()
+	dataDir1 := t.TempDir()
+	dataDir2 := t.TempDir()
+
+	port1 := getFreePort()
+	port2 := getFreePort()
+	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
+	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+
+	startClusterBroker := func(brokerID int, port uint16, dataDir string) (*exec.Cmd, func()) {
+		outFile, _ := os.CreateTemp("", "fluxmq-fo-*")
+		cmd := exec.Command(brokerBin,
+			fmt.Sprintf("--port=%d", port),
+			fmt.Sprintf("--data-dir=%s", dataDir),
+			fmt.Sprintf("--cluster-dir=%s", clusterDir),
+			"--broker-host=127.0.0.1",
+			fmt.Sprintf("--broker-id=%d", brokerID),
+			"--replication-factor=2",
+			"--replica-lag-ms=500",
+			"--broker-timeout-ms=4000",
+		)
+		cmd.Stdout = outFile
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start broker %d: %v", brokerID, err)
+		}
+		return cmd, func() {
+			cmd.Process.Kill()
+			cmd.Wait()
+			outFile.Close()
+			os.Remove(outFile.Name())
+		}
+	}
+
+	cmd1, cleanup1 := startClusterBroker(1, port1, dataDir1)
+	cmd2, cleanup2 := startClusterBroker(2, port2, dataDir2)
+	defer cleanup2()
+
+	if err := waitForTCP(addr1, 10*time.Second); err != nil {
+		t.Fatalf("broker 1 not ready: %v", err)
+	}
+	if err := waitForTCP(addr2, 10*time.Second); err != nil {
+		t.Fatalf("broker 2 not ready: %v", err)
+	}
+
+	// Give brokers time to discover each other.
+	time.Sleep(3 * time.Second)
+
+	// Set up topic.
+	client1, err := fluxmq.NewClient(addr1)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client1.Close()
+
+	topic := uniqueTopic("failover-test")
+	if err := client1.CreateTopic(topic, 1); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Connect a ClusterProducer through broker 1.
+	producer, err := fluxmq.NewClusterProducer(addr1, fluxmq.ProducerConfig{Acks: 1})
+	if err != nil {
+		t.Fatalf("NewClusterProducer: %v", err)
+	}
+	defer producer.Close()
+
+	// Wait for leader.
+	cc, err := fluxmq.NewClusterClient(addr1)
+	if err != nil {
+		t.Fatalf("NewClusterClient: %v", err)
+	}
+	defer cc.Close()
+
+	if err := cc.WaitForLeader(topic, 1, 10*time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+
+	// Produce before failover.
+	const before = 5
+	for i := 0; i < before; i++ {
+		if _, _, err := producer.SendSync(topic, 0, nil, []byte(fmt.Sprintf("pre-%d", i))); err != nil {
+			t.Fatalf("SendSync pre[%d]: %v", i, err)
+		}
+	}
+
+	// Wait for replication to propagate.
+	time.Sleep(2 * time.Second)
+
+	// Kill broker 1 (original leader).
+	cleanup1()
+	_ = cmd1
+
+	// Wait for broker 2 to elect itself as the new leader.
+	if err := cc.WaitForLeader(topic, 1, 15*time.Second); err != nil {
+		t.Fatalf("new leader not elected after failover: %v", err)
+	}
+
+	// Produce more messages — ClusterProducer should route to broker 2.
+	const after = 5
+	for i := 0; i < after; i++ {
+		if _, _, err := producer.SendSync(topic, 0, nil, []byte(fmt.Sprintf("post-%d", i))); err != nil {
+			t.Fatalf("SendSync post[%d]: %v", i, err)
+		}
+	}
+
+	// Fetch all and verify.
+	records, err := cc.Fetch(topic, 0, 0, 10*1024*1024, 2000)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	total := before + after
+	if len(records) != total {
+		t.Fatalf("expected %d records, got %d", total, len(records))
+	}
+
+	_ = cmd2
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // containsString checks whether s contains substr.

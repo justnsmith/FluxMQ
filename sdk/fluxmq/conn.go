@@ -34,9 +34,14 @@ func dial(addr string) (*conn, error) {
 	return c, nil
 }
 
-// roundtrip sends a request and waits for the matching response.
+// roundtrip sends a request with api_version=0 and waits for the matching response.
 // It is safe to call from multiple goroutines concurrently.
 func (c *conn) roundtrip(apiKey uint16, payload []byte) ([]byte, error) {
+	return c.roundtripVersion(apiKey, 0, payload)
+}
+
+// roundtripVersion sends a request with the given api_version and waits for the response.
+func (c *conn) roundtripVersion(apiKey uint16, apiVersion uint16, payload []byte) ([]byte, error) {
 	// Check if already closed.
 	select {
 	case <-c.closed:
@@ -50,7 +55,7 @@ func (c *conn) roundtrip(apiKey uint16, payload []byte) ([]byte, error) {
 	c.pending.Store(id, ch)
 	defer c.pending.Delete(id)
 
-	if err := c.writeFrame(apiKey, id, payload); err != nil {
+	if err := c.writeFrame(apiKey, apiVersion, id, payload); err != nil {
 		return nil, err
 	}
 
@@ -66,14 +71,14 @@ func (c *conn) roundtrip(apiKey uint16, payload []byte) ([]byte, error) {
 }
 
 // writeFrame encodes and sends a request frame on the wire.
-// Request wire format: [4B total_len][2B api_key][2B api_version=0][4B corr_id][payload...]
+// Request wire format: [4B total_len][2B api_key][2B api_version][4B corr_id][payload...]
 // total_len = 8 + len(payload)  (does NOT include itself)
-func (c *conn) writeFrame(apiKey uint16, corrID uint32, payload []byte) error {
+func (c *conn) writeFrame(apiKey uint16, apiVersion uint16, corrID uint32, payload []byte) error {
 	totalLen := uint32(8 + len(payload))
 	frame := make([]byte, 4+8+len(payload))
 	binary.BigEndian.PutUint32(frame[0:], totalLen)
 	binary.BigEndian.PutUint16(frame[4:], apiKey)
-	binary.BigEndian.PutUint16(frame[6:], 0) // api_version = 0
+	binary.BigEndian.PutUint16(frame[6:], apiVersion)
 	binary.BigEndian.PutUint32(frame[8:], corrID)
 	copy(frame[12:], payload)
 

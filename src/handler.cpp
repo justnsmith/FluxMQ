@@ -1,7 +1,9 @@
 #include "handler.h"
 
+#include "cluster_store.h"
 #include "codec.h"
 #include "errors.h"
+#include "replication_manager.h"
 
 #include <chrono>
 #include <iostream>
@@ -13,7 +15,10 @@ using Clock = std::chrono::steady_clock;
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 
-BrokerHandler::BrokerHandler(TopicManager &tm, GroupCoordinator &gc, PostFn post_fn) : tm_(tm), gc_(gc), post_fn_(std::move(post_fn))
+BrokerHandler::BrokerHandler(TopicManager &tm, GroupCoordinator &gc, PostFn post_fn, ClusterStore *cs, ReplicationManager *rm,
+                             int replication_factor, std::chrono::milliseconds broker_timeout)
+    : tm_(tm), gc_(gc), post_fn_(std::move(post_fn)), cs_(cs), rm_(rm), replication_factor_(replication_factor),
+      broker_timeout_(broker_timeout)
 {
     bg_thread_ = std::thread([this] { BackgroundLoop(); });
 }
@@ -62,6 +67,12 @@ void BrokerHandler::Handle(Connection &conn, RequestFrame frame)
         case api::kLeaveGroup:
             HandleLeaveGroup(conn, frame);
             break;
+        case api::kReplicaFetch:
+            HandleReplicaFetch(conn, frame);
+            break;
+        case api::kLeaderEpoch:
+            HandleLeaderEpoch(conn, frame);
+            break;
         default: {
             // Unknown API key — return a generic error.
             std::vector<uint8_t> body;
@@ -102,6 +113,18 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
         w.WriteU64(0);
         conn.SendResponse({frame.correlation_id, std::move(body)});
         return;
+    }
+
+    // In cluster mode, verify we are the leader for the target partition.
+    if (cs_) {
+        int target_part = (part_id >= 0) ? part_id : 0; // for kNotLeader check, any partition works
+        if (!cs_->IsLeader(topic, target_part)) {
+            w.WriteI16(err::kNotLeader);
+            w.WriteI32(0);
+            w.WriteU64(0);
+            conn.SendResponse({frame.correlation_id, std::move(body)});
+            return;
+        }
     }
 
     int actual_part;
@@ -178,8 +201,8 @@ void BrokerHandler::HandleFetch(Connection &conn, const RequestFrame &frame)
 
     Partition &part = t->GetPartition(part_id);
 
-    // If data is available, respond immediately.
-    if (part.NextOffset() > fetch_off) {
+    // If data is available (up to HWM), respond immediately.
+    if (part.HighWatermark() > fetch_off) {
         auto records = part.ReadBatch(fetch_off, max_bytes);
         conn.SendResponse(BuildFetchResponse(frame.correlation_id, records));
         return;
@@ -217,7 +240,29 @@ void BrokerHandler::HandleCreateTopic(Connection &conn, const RequestFrame &fram
 
     std::vector<uint8_t> body;
     BinaryWriter w(body);
-    w.WriteI16(tm_.CreateTopic(topic, num_parts));
+    int16_t rc = tm_.CreateTopic(topic, num_parts);
+    if (rc == err::kOk && cs_) {
+        // Register partition assignments in the cluster store.
+        cs_->AssignNewTopic(topic, num_parts, replication_factor_, broker_timeout_);
+        // Initialise leader-side HWM and follower tracking.
+        for (int p = 0; p < num_parts; ++p) {
+            Topic *t = tm_.FindTopic(topic);
+            if (!t)
+                continue;
+            auto asgn = cs_->GetAssignment(topic, p);
+            if (!asgn)
+                continue;
+            Partition &part = t->GetPartition(p);
+            if (asgn->leader_id == cs_->SelfId()) {
+                // Leader: HWM tracks NextOffset for ISR-only case.
+                if (asgn->isr.size() == 1)
+                    part.SetHighWatermark(part.NextOffset());
+                else
+                    part.SetHighWatermark(0);
+            }
+        }
+    }
+    w.WriteI16(rc);
     conn.SendResponse({frame.correlation_id, std::move(body)});
 }
 
@@ -231,11 +276,49 @@ void BrokerHandler::HandleMetadata(Connection &conn, const RequestFrame &frame)
     auto topics = tm_.ListTopics();
     std::vector<uint8_t> body;
     BinaryWriter w(body);
-    w.WriteU32(static_cast<uint32_t>(topics.size()));
-    for (const auto &[name, np] : topics) {
-        w.WriteString(name);
-        w.WriteI32(np);
+
+    if (frame.api_version >= 1 && cs_) {
+        // Extended v1 response:
+        // [4B num_brokers] per broker: [4B id][2B host][2B port]
+        // [4B num_topics] per topic: [2B name][4B num_parts]
+        //   per partition: [4B id][4B leader_id][4B leader_epoch]
+        //                  [4B num_replicas][4B...] [4B num_isr][4B...]
+        auto brokers = cs_->GetBrokers();
+        w.WriteU32(static_cast<uint32_t>(brokers.size()));
+        for (const auto &b : brokers) {
+            w.WriteI32(b.id);
+            w.WriteString(b.host);
+            w.WriteU16(b.port);
+        }
+        w.WriteU32(static_cast<uint32_t>(topics.size()));
+        for (const auto &[name, np] : topics) {
+            w.WriteString(name);
+            w.WriteU32(static_cast<uint32_t>(np));
+            for (int p = 0; p < np; ++p) {
+                auto asgn = cs_->GetAssignment(name, p);
+                w.WriteI32(p);
+                w.WriteI32(asgn ? asgn->leader_id : cs_->SelfId());
+                w.WriteI32(asgn ? asgn->leader_epoch : 0);
+                auto replicas = asgn ? asgn->replicas : std::vector<int32_t>{cs_->SelfId()};
+                auto isr = asgn ? asgn->isr : std::vector<int32_t>{cs_->SelfId()};
+                w.WriteU32(static_cast<uint32_t>(replicas.size()));
+                for (int32_t r : replicas)
+                    w.WriteI32(r);
+                w.WriteU32(static_cast<uint32_t>(isr.size()));
+                for (int32_t r : isr)
+                    w.WriteI32(r);
+            }
+        }
     }
+    else {
+        // Legacy v0 response (backward-compatible).
+        w.WriteU32(static_cast<uint32_t>(topics.size()));
+        for (const auto &[name, np] : topics) {
+            w.WriteString(name);
+            w.WriteI32(np);
+        }
+    }
+
     conn.SendResponse({frame.correlation_id, std::move(body)});
 }
 
@@ -414,7 +497,7 @@ void BrokerHandler::BackgroundLoop()
         std::vector<PendingFetch> keep;
 
         for (auto &pf : local) {
-            bool data_ready = pf.partition->NextOffset() > pf.fetch_offset;
+            bool data_ready = pf.partition->HighWatermark() > pf.fetch_offset;
             bool timed_out = now >= pf.deadline;
 
             if (data_ready || timed_out) {
@@ -448,5 +531,142 @@ void BrokerHandler::HandleLeaveGroup(Connection &conn, const RequestFrame &frame
     std::vector<uint8_t> body;
     BinaryWriter w(body);
     w.WriteI16(gc_.Leave(group, member));
+    conn.SendResponse({frame.correlation_id, std::move(body)});
+}
+
+// ---------------------------------------------------------------------------
+// REPLICA_FETCH  (API key 10) — follower → leader pull replication
+//
+// request:  [4B follower_id][2B topic][4B partition][8B offset][4B max_bytes][4B leader_epoch]
+// response: [2B error][4B leader_epoch][8B high_watermark][4B num_records] + records
+// ---------------------------------------------------------------------------
+
+void BrokerHandler::HandleReplicaFetch(Connection &conn, const RequestFrame &frame)
+{
+    BinaryReader r(frame.payload);
+    int32_t follower_id = r.ReadI32();
+    std::string topic = r.ReadString();
+    int32_t part_id = r.ReadI32();
+    uint64_t fetch_off = r.ReadU64();
+    uint32_t max_bytes = r.ReadU32();
+    int32_t req_epoch = r.ReadI32();
+
+    std::vector<uint8_t> body;
+    BinaryWriter w(body);
+
+    // Verify we are the leader (only in cluster mode).
+    if (cs_ && !cs_->IsLeader(topic, part_id)) {
+        w.WriteI16(err::kNotLeader);
+        w.WriteI32(0);
+        w.WriteU64(0);
+        w.WriteU32(0);
+        conn.SendResponse({frame.correlation_id, std::move(body)});
+        return;
+    }
+
+    // Epoch check.
+    int32_t leader_epoch = 0;
+    if (cs_) {
+        auto asgn = cs_->GetAssignment(topic, part_id);
+        if (asgn)
+            leader_epoch = asgn->leader_epoch;
+        if (req_epoch != 0 && req_epoch != leader_epoch) {
+            w.WriteI16(err::kFencedLeaderEpoch);
+            w.WriteI32(leader_epoch);
+            w.WriteU64(0);
+            w.WriteU32(0);
+            conn.SendResponse({frame.correlation_id, std::move(body)});
+            return;
+        }
+    }
+
+    Topic *t = tm_.FindTopic(topic);
+    if (!t) {
+        w.WriteI16(err::kUnknownTopic);
+        w.WriteI32(0);
+        w.WriteU64(0);
+        w.WriteU32(0);
+        conn.SendResponse({frame.correlation_id, std::move(body)});
+        return;
+    }
+    if (part_id < 0 || part_id >= t->NumPartitions()) {
+        w.WriteI16(err::kInvalidPartition);
+        w.WriteI32(0);
+        w.WriteU64(0);
+        w.WriteU32(0);
+        conn.SendResponse({frame.correlation_id, std::move(body)});
+        return;
+    }
+
+    Partition &part = t->GetPartition(part_id);
+    uint64_t hwm = part.HighWatermark();
+
+    // Notify ReplicationManager of follower progress; this may advance HWM.
+    if (rm_)
+        rm_->OnFollowerFetch(topic, part_id, follower_id, fetch_off);
+
+    // Serve records up to NextOffset (not capped at HWM; followers need all data).
+    auto records = part.ReadBatchForReplication(fetch_off, max_bytes);
+
+    w.WriteI16(err::kOk);
+    w.WriteI32(leader_epoch);
+    w.WriteU64(hwm);
+    w.WriteU32(static_cast<uint32_t>(records.size()));
+    for (const auto &rec : records) {
+        w.WriteU64(rec.offset);
+        w.WriteU32(static_cast<uint32_t>(rec.value.size()));
+        w.WriteBytes(rec.value.data(), rec.value.size());
+    }
+    conn.SendResponse({frame.correlation_id, std::move(body)});
+}
+
+// ---------------------------------------------------------------------------
+// LEADER_EPOCH  (API key 11)
+//
+// request:  [2B topic][4B partition]
+// response: [2B error][4B leader_epoch][4B leader_broker_id][8B log_end_offset]
+// ---------------------------------------------------------------------------
+
+void BrokerHandler::HandleLeaderEpoch(Connection &conn, const RequestFrame &frame)
+{
+    BinaryReader r(frame.payload);
+    std::string topic = r.ReadString();
+    int32_t part_id = r.ReadI32();
+
+    std::vector<uint8_t> body;
+    BinaryWriter w(body);
+
+    int32_t leader_id = cs_ ? cs_->SelfId() : 0;
+    int32_t leader_epoch = 0;
+    uint64_t log_end = 0;
+
+    if (cs_) {
+        auto asgn = cs_->GetAssignment(topic, part_id);
+        if (asgn) {
+            leader_id = asgn->leader_id;
+            leader_epoch = asgn->leader_epoch;
+        }
+    }
+
+    Topic *t = tm_.FindTopic(topic);
+    if (!t) {
+        w.WriteI16(err::kUnknownTopic);
+        w.WriteI32(0);
+        w.WriteI32(0);
+        w.WriteU64(0);
+    }
+    else if (part_id < 0 || part_id >= t->NumPartitions()) {
+        w.WriteI16(err::kInvalidPartition);
+        w.WriteI32(0);
+        w.WriteI32(0);
+        w.WriteU64(0);
+    }
+    else {
+        log_end = t->GetPartition(part_id).NextOffset();
+        w.WriteI16(err::kOk);
+        w.WriteI32(leader_epoch);
+        w.WriteI32(leader_id);
+        w.WriteU64(log_end);
+    }
     conn.SendResponse({frame.correlation_id, std::move(body)});
 }

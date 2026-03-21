@@ -29,17 +29,16 @@ uint64_t Partition::Append(const uint8_t *data, size_t len)
 }
 
 // ---------------------------------------------------------------------------
-// ReadBatch
+// ReadBatchUpTo (internal shared logic)
 // ---------------------------------------------------------------------------
 
-std::vector<Record> Partition::ReadBatch(uint64_t fetch_offset, uint32_t max_bytes) const
+std::vector<Record> Partition::ReadBatchUpTo(uint64_t fetch_offset, uint32_t max_bytes, uint64_t limit) const
 {
-    std::lock_guard<std::mutex> lock(mu_);
     std::vector<Record> result;
     uint64_t cur = fetch_offset;
     uint32_t total = 0;
 
-    while (true) {
+    while (cur < limit) {
         auto raw = log_.Read(cur);
         if (raw.empty())
             break;
@@ -64,13 +63,59 @@ std::vector<Record> Partition::ReadBatch(uint64_t fetch_offset, uint32_t max_byt
 }
 
 // ---------------------------------------------------------------------------
+// ReadBatch  (consumer-facing; capped at HighWatermark)
+// ---------------------------------------------------------------------------
+
+std::vector<Record> Partition::ReadBatch(uint64_t fetch_offset, uint32_t max_bytes) const
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    uint64_t h = hwm_.load(std::memory_order_acquire);
+    uint64_t limit = (h == kUnreplicatedHWM) ? log_.NextOffset() : h;
+    return ReadBatchUpTo(fetch_offset, max_bytes, limit);
+}
+
+// ---------------------------------------------------------------------------
+// ReadBatchForReplication  (reads up to NextOffset, ignoring HWM)
+// ---------------------------------------------------------------------------
+
+std::vector<Record> Partition::ReadBatchForReplication(uint64_t fetch_offset, uint32_t max_bytes) const
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    return ReadBatchUpTo(fetch_offset, max_bytes, log_.NextOffset());
+}
+
+// ---------------------------------------------------------------------------
 // WaitForData
 // ---------------------------------------------------------------------------
 
 bool Partition::WaitForData(uint64_t fetch_offset, std::chrono::steady_clock::time_point deadline)
 {
     std::unique_lock<std::mutex> lock(mu_);
-    return cv_.wait_until(lock, deadline, [&] { return log_.NextOffset() > fetch_offset; });
+    return cv_.wait_until(lock, deadline, [&] {
+        uint64_t h = hwm_.load(std::memory_order_relaxed);
+        uint64_t limit = (h == kUnreplicatedHWM) ? log_.NextOffset() : h;
+        return limit > fetch_offset;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// HighWatermark / SetHighWatermark
+// ---------------------------------------------------------------------------
+
+uint64_t Partition::HighWatermark() const
+{
+    uint64_t h = hwm_.load(std::memory_order_acquire);
+    if (h == kUnreplicatedHWM) {
+        std::lock_guard<std::mutex> lock(mu_);
+        return log_.NextOffset();
+    }
+    return h;
+}
+
+void Partition::SetHighWatermark(uint64_t hwm)
+{
+    hwm_.store(hwm, std::memory_order_release);
+    cv_.notify_all();
 }
 
 // ---------------------------------------------------------------------------

@@ -5,10 +5,38 @@ type Client struct {
 	conn *conn
 }
 
-// TopicMeta describes a topic returned by the Metadata API.
+// TopicMeta describes a topic returned by the Metadata v0 API.
 type TopicMeta struct {
 	Name          string
 	NumPartitions int32
+}
+
+// BrokerMeta describes a broker in the cluster (v1 metadata).
+type BrokerMeta struct {
+	ID   int32
+	Host string
+	Port uint16
+}
+
+// PartitionMeta describes a single partition's replication state (v1 metadata).
+type PartitionMeta struct {
+	ID          int32
+	LeaderID    int32
+	LeaderEpoch int32
+	Replicas    []int32
+	ISR         []int32
+}
+
+// TopicMetaV1 is a topic entry in the v1 metadata response.
+type TopicMetaV1 struct {
+	Name       string
+	Partitions []PartitionMeta
+}
+
+// ClusterMetadata is the full v1 metadata response.
+type ClusterMetadata struct {
+	Brokers []BrokerMeta
+	Topics  []TopicMetaV1
 }
 
 // Record is a single message returned by the Fetch API.
@@ -64,7 +92,7 @@ func (c *Client) CreateTopic(name string, numPartitions int32) error {
 	return codeToError(dec.i16())
 }
 
-// ─── Metadata ─────────────────────────────────────────────────────────────────
+// ─── Metadata v0 ──────────────────────────────────────────────────────────────
 // Request:  (empty)
 // Response: [4B num_topics][topics: 2B name + 4B num_parts]
 
@@ -88,6 +116,78 @@ func (c *Client) Metadata() ([]TopicMeta, error) {
 		topics = append(topics, TopicMeta{Name: name, NumPartitions: numParts})
 	}
 	return topics, nil
+}
+
+// ─── Metadata v1 ──────────────────────────────────────────────────────────────
+// Extended cluster metadata including broker list and per-partition replication state.
+// Request:  (empty, api_version=1)
+// Response: [4B num_brokers][brokers: 4B id + 2B host + 2B port]
+//           [4B num_topics][topics: 2B name + 4B num_parts]
+//             per partition: [4B id][4B leader_id][4B epoch]
+//                            [4B num_replicas][4B...] [4B num_isr][4B...]
+
+func (c *Client) MetadataV1() (*ClusterMetadata, error) {
+	resp, err := c.conn.roundtripVersion(apiMetadata, 1, nil)
+	if err != nil {
+		return nil, err
+	}
+	dec := newDecoder(resp)
+
+	numBrokers := dec.u32()
+	if dec.err != nil {
+		return nil, dec.err
+	}
+	brokers := make([]BrokerMeta, 0, numBrokers)
+	for i := uint32(0); i < numBrokers; i++ {
+		id := dec.i32()
+		host := dec.str()
+		port := dec.u16()
+		if dec.err != nil {
+			return nil, dec.err
+		}
+		brokers = append(brokers, BrokerMeta{ID: id, Host: host, Port: port})
+	}
+
+	numTopics := dec.u32()
+	if dec.err != nil {
+		return nil, dec.err
+	}
+	topics := make([]TopicMetaV1, 0, numTopics)
+	for i := uint32(0); i < numTopics; i++ {
+		name := dec.str()
+		numParts := dec.u32()
+		if dec.err != nil {
+			return nil, dec.err
+		}
+		parts := make([]PartitionMeta, 0, numParts)
+		for j := uint32(0); j < numParts; j++ {
+			pid := dec.i32()
+			lid := dec.i32()
+			epoch := dec.i32()
+			numReplicas := dec.u32()
+			replicas := make([]int32, 0, numReplicas)
+			for k := uint32(0); k < numReplicas; k++ {
+				replicas = append(replicas, dec.i32())
+			}
+			numISR := dec.u32()
+			isr := make([]int32, 0, numISR)
+			for k := uint32(0); k < numISR; k++ {
+				isr = append(isr, dec.i32())
+			}
+			if dec.err != nil {
+				return nil, dec.err
+			}
+			parts = append(parts, PartitionMeta{
+				ID:          pid,
+				LeaderID:    lid,
+				LeaderEpoch: epoch,
+				Replicas:    replicas,
+				ISR:         isr,
+			})
+		}
+		topics = append(topics, TopicMetaV1{Name: name, Partitions: parts})
+	}
+	return &ClusterMetadata{Brokers: brokers, Topics: topics}, nil
 }
 
 // ─── Produce ──────────────────────────────────────────────────────────────────
@@ -301,6 +401,33 @@ func (c *Client) OffsetFetch(group, topic string, partID int32) (uint64, error) 
 	return offset, nil
 }
 
+// ─── LeaderEpoch ──────────────────────────────────────────────────────────────
+// Request:  [2B topic][4B partition]
+// Response: [2B error][4B epoch][4B leader_id][8B log_end_offset]
+
+func (c *Client) LeaderEpoch(topic string, partID int32) (epoch, leaderID int32, leo uint64, err error) {
+	var enc encoder
+	enc.str(topic)
+	enc.i32(partID)
+
+	resp, err := c.conn.roundtrip(apiLeaderEpoch, enc.bytes())
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	dec := newDecoder(resp)
+	code := dec.i16()
+	epoch = dec.i32()
+	leaderID = dec.i32()
+	leo = dec.u64()
+	if dec.err != nil {
+		return 0, 0, 0, dec.err
+	}
+	if brokerErr := codeToError(code); brokerErr != nil {
+		return epoch, leaderID, leo, brokerErr
+	}
+	return epoch, leaderID, leo, nil
+}
+
 // ─── API key constants ────────────────────────────────────────────────────────
 
 // ─── LeaveGroup ───────────────────────────────────────────────────────────────
@@ -333,4 +460,6 @@ const (
 	apiOffsetCommit uint16 = 7
 	apiOffsetFetch  uint16 = 8
 	apiLeaveGroup   uint16 = 9
+	apiReplicaFetch uint16 = 10
+	apiLeaderEpoch  uint16 = 11
 )

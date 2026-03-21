@@ -2,10 +2,12 @@
 
 #include "log.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -32,15 +34,27 @@ class Partition
     // Append value bytes; returns the assigned logical offset.
     uint64_t Append(const uint8_t *data, size_t len);
 
-    // Read records starting at fetch_offset, accumulating up to max_bytes of payload.
-    // Always returns at least one record if fetch_offset < NextOffset().
+    // Consumer-facing read: capped at HighWatermark() so consumers never see
+    // data that hasn't been committed to all ISR members yet.
+    // In standalone mode HighWatermark() == NextOffset() so behaviour is unchanged.
     std::vector<Record> ReadBatch(uint64_t fetch_offset, uint32_t max_bytes) const;
 
-    // Block until NextOffset() > fetch_offset OR the deadline passes.
-    // Returns true if data became available before the deadline.
+    // Replication-facing read: reads up to NextOffset() ignoring the HWM.
+    // Used by HandleReplicaFetch to send un-committed data to followers.
+    std::vector<Record> ReadBatchForReplication(uint64_t fetch_offset, uint32_t max_bytes) const;
+
+    // Block until HighWatermark() > fetch_offset OR the deadline passes.
     bool WaitForData(uint64_t fetch_offset, std::chrono::steady_clock::time_point deadline);
 
     uint64_t NextOffset() const;
+
+    // High-watermark — the highest offset that has been replicated to all
+    // current ISR members (and therefore safe to serve to consumers).
+    // Sentinel kUnreplicatedHWM means standalone mode: HighWatermark()==NextOffset().
+    static constexpr uint64_t kUnreplicatedHWM = std::numeric_limits<uint64_t>::max();
+
+    uint64_t HighWatermark() const;
+    void SetHighWatermark(uint64_t hwm); // called by ReplicationManager
 
     // Consumer group offset management.
     void CommitOffset(std::string_view group, uint64_t offset);
@@ -53,6 +67,7 @@ class Partition
 
   private:
     void LoadOffsets();
+    std::vector<Record> ReadBatchUpTo(uint64_t fetch_offset, uint32_t max_bytes, uint64_t limit) const;
 
     int id_;
     Log log_;
@@ -61,4 +76,6 @@ class Partition
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::unordered_map<std::string, uint64_t> offsets_;
+
+    std::atomic<uint64_t> hwm_{kUnreplicatedHWM};
 };

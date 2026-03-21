@@ -64,10 +64,11 @@ type Message struct {
 
 // Consumer is a channel-based consumer with consumer group support.
 type Consumer struct {
-	client   *Client
-	cfg      ConsumerConfig
-	topic    string
-	memberID string
+	client        *Client
+	clusterClient *ClusterClient // non-nil in cluster mode; used to route fetches to leader
+	cfg           ConsumerConfig
+	topic         string
+	memberID      string
 
 	msgCh     chan *Message
 	doneCh    chan struct{}
@@ -89,6 +90,32 @@ func NewConsumer(addr string, cfg ConsumerConfig) (*Consumer, error) {
 		memberID: fmt.Sprintf("consumer-%d-%d", os.Getpid(), rand.Int63()),
 		msgCh:    make(chan *Message, 256),
 		doneCh:   make(chan struct{}),
+	}
+	return c, nil
+}
+
+// NewClusterConsumer creates a Consumer that routes fetch requests to the
+// correct partition leader via a ClusterClient.  seedAddr is any broker in
+// the cluster.  Group-coordination requests (JoinGroup, SyncGroup, Heartbeat,
+// OffsetCommit/Fetch) still go through the seed broker connection.
+func NewClusterConsumer(seedAddr string, cfg ConsumerConfig) (*Consumer, error) {
+	cfg.applyDefaults()
+	client, err := NewClient(seedAddr)
+	if err != nil {
+		return nil, err
+	}
+	cc, err := NewClusterClient(seedAddr)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	c := &Consumer{
+		client:        client,
+		clusterClient: cc,
+		cfg:           cfg,
+		memberID:      fmt.Sprintf("consumer-%d-%d", os.Getpid(), rand.Int63()),
+		msgCh:         make(chan *Message, 256),
+		doneCh:        make(chan struct{}),
 	}
 	return c, nil
 }
@@ -124,6 +151,9 @@ func (c *Consumer) Close() error {
 		close(c.doneCh)
 		c.wg.Wait()
 		c.client.Close()
+		if c.clusterClient != nil {
+			c.clusterClient.Close()
+		}
 	})
 	return nil
 }
@@ -389,7 +419,13 @@ func (c *Consumer) fetchLoop(ctx context.Context, partID int32, genID int32) {
 		default:
 		}
 
-		records, err := c.client.Fetch(c.topic, partID, offset, c.cfg.MaxBytes, c.cfg.MaxWaitMs)
+		var records []Record
+		var err error
+		if c.clusterClient != nil {
+			records, err = c.clusterClient.Fetch(c.topic, partID, offset, c.cfg.MaxBytes, c.cfg.MaxWaitMs)
+		} else {
+			records, err = c.client.Fetch(c.topic, partID, offset, c.cfg.MaxBytes, c.cfg.MaxWaitMs)
+		}
 		if err != nil {
 			// On any error, back off briefly and retry.
 			select {

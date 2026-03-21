@@ -55,6 +55,11 @@ type Producer struct {
 	client *Client
 	cfg    ProducerConfig
 
+	// clusterSend, if non-nil, is used instead of client.Produce (cluster mode).
+	clusterSend func(topic string, partID int32, key, value []byte) (int32, uint64, error)
+	// closeFn, if non-nil, is called instead of client.Close (cluster mode).
+	closeFn func() error
+
 	mu      sync.Mutex
 	pending []pendingRecord
 	timer   *time.Timer
@@ -78,6 +83,26 @@ func NewProducer(addr string, cfg ProducerConfig) (*Producer, error) {
 		cfg:     cfg,
 		flushCh: make(chan []pendingRecord, 64),
 		doneCh:  make(chan struct{}),
+	}
+	p.wg.Add(1)
+	go p.flushWorker()
+	return p, nil
+}
+
+// NewClusterProducer creates a Producer that routes each record to the correct
+// partition leader via a ClusterClient.  seedAddr is any broker in the cluster.
+func NewClusterProducer(seedAddr string, cfg ProducerConfig) (*Producer, error) {
+	cfg.applyDefaults()
+	cc, err := NewClusterClient(seedAddr)
+	if err != nil {
+		return nil, err
+	}
+	p := &Producer{
+		cfg:         cfg,
+		clusterSend: cc.Produce,
+		closeFn:     func() error { cc.Close(); return nil },
+		flushCh:     make(chan []pendingRecord, 64),
+		doneCh:      make(chan struct{}),
 	}
 	p.wg.Add(1)
 	go p.flushWorker()
@@ -109,6 +134,9 @@ func (p *Producer) Send(topic string, key, value []byte) error {
 
 // SendSync sends a single record synchronously, bypassing the batcher.
 func (p *Producer) SendSync(topic string, partID int32, key, value []byte) (int32, uint64, error) {
+	if p.clusterSend != nil {
+		return p.clusterSend(topic, partID, key, value)
+	}
 	return p.client.Produce(topic, partID, key, value)
 }
 
@@ -167,7 +195,11 @@ func (p *Producer) Close() error {
 
 		close(p.doneCh)
 		p.wg.Wait()
-		p.client.Close()
+		if p.closeFn != nil {
+			p.closeFn()
+		} else if p.client != nil {
+			p.client.Close()
+		}
 	})
 	return p.closeErr
 }
@@ -261,7 +293,14 @@ func (p *Producer) sendBatch(batch []pendingRecord) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			part, off, err := p.client.Produce(rec.topic, rec.partID, rec.key, rec.val)
+			var part int32
+			var off uint64
+			var err error
+			if p.clusterSend != nil {
+				part, off, err = p.clusterSend(rec.topic, rec.partID, rec.key, rec.val)
+			} else {
+				part, off, err = p.client.Produce(rec.topic, rec.partID, rec.key, rec.val)
+			}
 			if rec.resCh != nil {
 				rec.resCh <- SendResult{Partition: part, Offset: off, Err: err}
 			}

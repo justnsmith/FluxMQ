@@ -16,13 +16,16 @@ func (e *BrokerError) Error() string {
 var (
 	ErrOffsetOutOfRange    = &BrokerError{Code: 1, Message: "offset out of range"}
 	ErrUnknownTopic        = &BrokerError{Code: 3, Message: "unknown topic"}
+	ErrNotLeader           = &BrokerError{Code: 6, Message: "not the leader for this partition"}
+	ErrBrokerNotAvailable  = &BrokerError{Code: 8, Message: "broker not available"}
+	ErrInvalidPartition    = &BrokerError{Code: 10, Message: "invalid partition"}
 	ErrGroupNotFound       = &BrokerError{Code: 16, Message: "group not found"}
 	ErrIllegalGeneration   = &BrokerError{Code: 22, Message: "illegal generation"}
 	ErrUnknownMemberId     = &BrokerError{Code: 25, Message: "unknown member id"}
 	ErrRebalanceInProgress = &BrokerError{Code: 27, Message: "rebalance in progress"}
 	ErrTopicAlreadyExists  = &BrokerError{Code: 36, Message: "topic already exists"}
-	ErrInvalidPartition    = &BrokerError{Code: 10, Message: "invalid partition"}
 	ErrInvalidRequest      = &BrokerError{Code: 42, Message: "invalid request"}
+	ErrFencedLeaderEpoch   = &BrokerError{Code: 74, Message: "fenced leader epoch"}
 )
 
 // codeToError maps an int16 error code to the corresponding typed error.
@@ -35,6 +38,10 @@ func codeToError(code int16) error {
 		return ErrOffsetOutOfRange
 	case 3:
 		return ErrUnknownTopic
+	case 6:
+		return ErrNotLeader
+	case 8:
+		return ErrBrokerNotAvailable
 	case 10:
 		return ErrInvalidPartition
 	case 16:
@@ -49,6 +56,8 @@ func codeToError(code int16) error {
 		return ErrTopicAlreadyExists
 	case 42:
 		return ErrInvalidRequest
+	case 74:
+		return ErrFencedLeaderEpoch
 	default:
 		return &BrokerError{Code: code, Message: "unknown error"}
 	}

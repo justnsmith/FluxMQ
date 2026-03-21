@@ -1,5 +1,5 @@
 CXX      := g++
-CXXFLAGS := -std=c++20 -Wall -Wextra -Iinclude
+CXXFLAGS := -std=c++20 -Wall -Wextra -Iinclude -MMD -MP
 BUILD    := build
 
 TARGET          := $(BUILD)/fluxmq
@@ -16,8 +16,11 @@ STORAGE_SRCS := src/segment.cpp src/log.cpp
 NET_SRCS := src/buffer.cpp src/reactor.cpp src/connection.cpp src/server.cpp
 
 # Phase 3: broker core
+# Phase 6: replication
 BROKER_SRCS := src/partition.cpp src/topic.cpp src/topic_manager.cpp \
-               src/group_coordinator.cpp src/handler.cpp
+               src/group_coordinator.cpp src/handler.cpp \
+               src/cluster_store.cpp src/replica_client.cpp \
+               src/replication_manager.cpp src/leader_elector.cpp
 
 # All library objects (shared by main binary and tests)
 LIB_SRCS := $(STORAGE_SRCS) $(NET_SRCS) $(BROKER_SRCS)
@@ -84,6 +87,11 @@ sdk-test: $(TARGET)
 
 sdk-vet:
 	cd $(SDK_DIR) && go vet ./...
+
+# ── Auto-generated header dependencies ───────────────────────────────────────
+
+ALL_OBJS := $(MAIN_OBJS) $(BUILD)/test_log.o $(BUILD)/test_server.o $(BUILD)/test_broker.o
+-include $(ALL_OBJS:.o=.d)
 
 clean:
 	rm -rf $(BUILD)
