@@ -1,5 +1,6 @@
 #include "metrics.h"
 
+#include <mutex>
 #include <sstream>
 #include <string>
 
