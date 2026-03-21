@@ -1,6 +1,7 @@
 #include "partition.h"
 
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
