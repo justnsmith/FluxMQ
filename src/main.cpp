@@ -2,6 +2,8 @@
 #include "group_coordinator.h"
 #include "handler.h"
 #include "leader_elector.h"
+#include "metrics.h"
+#include "metrics_server.h"
 #include "replication_manager.h"
 #include "server.h"
 #include "topic_manager.h"
@@ -18,6 +20,7 @@
 int main(int argc, char *argv[])
 {
     uint16_t port = 9092;
+    uint16_t metrics_port = 0; // 0 = port+1 (computed after bind)
     std::string data_dir = "/tmp/fluxmq_data";
     std::string cluster_dir;
     std::string broker_host = "127.0.0.1";
@@ -31,6 +34,8 @@ int main(int argc, char *argv[])
         std::string arg = argv[i];
         if (arg.rfind("--port=", 0) == 0)
             port = static_cast<uint16_t>(std::stoi(arg.substr(7)));
+        else if (arg.rfind("--metrics-port=", 0) == 0)
+            metrics_port = static_cast<uint16_t>(std::stoi(arg.substr(15)));
         else if (arg.rfind("--data-dir=", 0) == 0)
             data_dir = arg.substr(11);
         else if (arg.rfind("--cluster-dir=", 0) == 0)
@@ -50,6 +55,8 @@ int main(int argc, char *argv[])
     }
 
     std::filesystem::create_directories(data_dir);
+
+    MetricsRegistry metrics;
 
     TopicManager tm(data_dir);
     auto gc_timeout = std::chrono::milliseconds(session_timeout_ms);
@@ -77,13 +84,21 @@ int main(int argc, char *argv[])
 
     auto broker = std::make_shared<BrokerHandler>(
         tm, gc, [&srv](int fd, ResponseFrame resp) { srv->PostResponse(fd, std::move(resp)); }, cs.get(), rm.get(), replication_factor,
-        std::chrono::milliseconds(broker_timeout_ms));
+        std::chrono::milliseconds(broker_timeout_ms), &metrics);
 
     srv = std::make_unique<Server>([broker](Connection &conn, RequestFrame frame) { broker->Handle(conn, frame); });
 
     std::thread t([&] { srv->Run(port); });
     uint16_t bound = srv->WaitReady();
     printf("FluxMQ broker listening on port %u  (data: %s)\n", bound, data_dir.c_str());
+
+    // Start metrics HTTP server on metrics_port (default: broker port + 1).
+    if (metrics_port == 0 && port != 0)
+        metrics_port = bound + 1;
+    MetricsServer metrics_srv(metrics, metrics_port);
+    metrics_srv.Start();
+    if (metrics_srv.Port() > 0)
+        printf("FluxMQ metrics endpoint on port %u\n", metrics_srv.Port());
 
     // Start replication after the server is listening.
     if (rm)

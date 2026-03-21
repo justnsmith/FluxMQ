@@ -17,8 +17,8 @@ using Clock = std::chrono::steady_clock;
 // ---------------------------------------------------------------------------
 
 BrokerHandler::BrokerHandler(TopicManager &tm, GroupCoordinator &gc, PostFn post_fn, ClusterStore *cs, ReplicationManager *rm,
-                             int replication_factor, std::chrono::milliseconds broker_timeout)
-    : tm_(tm), gc_(gc), post_fn_(std::move(post_fn)), cs_(cs), rm_(rm), replication_factor_(replication_factor),
+                             int replication_factor, std::chrono::milliseconds broker_timeout, MetricsRegistry *metrics)
+    : tm_(tm), gc_(gc), post_fn_(std::move(post_fn)), cs_(cs), rm_(rm), metrics_(metrics), replication_factor_(replication_factor),
       broker_timeout_(broker_timeout)
 {
     bg_thread_ = std::thread([this] { BackgroundLoop(); });
@@ -149,6 +149,12 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
         actual_part = part_id;
     }
 
+    if (metrics_) {
+        metrics_->messages_in_total.fetch_add(1, std::memory_order_relaxed);
+        metrics_->bytes_in_total.fetch_add(val.size(), std::memory_order_relaxed);
+        metrics_->SetPartitionLEO(topic, actual_part, offset + 1);
+    }
+
     // In leader-only ISR mode (no in-sync followers), advance HWM immediately
     // so that consumers can read newly produced records without waiting for
     // the maintenance loop.
@@ -187,6 +193,8 @@ ResponseFrame BrokerHandler::BuildFetchResponse(uint32_t corr_id, const std::vec
 
 void BrokerHandler::HandleFetch(Connection &conn, const RequestFrame &frame)
 {
+    auto fetch_start = Clock::now();
+
     BinaryReader r(frame.payload);
     std::string topic = r.ReadString();
     int32_t part_id = r.ReadI32();
@@ -216,6 +224,15 @@ void BrokerHandler::HandleFetch(Connection &conn, const RequestFrame &frame)
     // If data is available (up to HWM), respond immediately.
     if (part.HighWatermark() > fetch_off) {
         auto records = part.ReadBatch(fetch_off, max_bytes);
+        if (metrics_) {
+            uint64_t out_bytes = 0;
+            for (const auto &rec : records)
+                out_bytes += rec.value.size();
+            metrics_->messages_out_total.fetch_add(records.size(), std::memory_order_relaxed);
+            metrics_->bytes_out_total.fetch_add(out_bytes, std::memory_order_relaxed);
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - fetch_start).count();
+            metrics_->ObserveFetchLatency(static_cast<uint64_t>(ms));
+        }
         conn.SendResponse(BuildFetchResponse(frame.correlation_id, records));
         return;
     }
@@ -229,6 +246,7 @@ void BrokerHandler::HandleFetch(Connection &conn, const RequestFrame &frame)
         pf.fetch_offset = fetch_off;
         pf.max_bytes = max_bytes;
         pf.deadline = Clock::now() + std::chrono::milliseconds(max_wait_ms);
+        pf.start_time = fetch_start;
         std::lock_guard lock(pending_mu_);
         pending_fetches_.push_back(std::move(pf));
         // Do NOT call SendResponse — the background thread will do it.
@@ -236,6 +254,10 @@ void BrokerHandler::HandleFetch(Connection &conn, const RequestFrame &frame)
     }
 
     // max_wait_ms == 0: return empty immediately.
+    if (metrics_) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - fetch_start).count();
+        metrics_->ObserveFetchLatency(static_cast<uint64_t>(ms));
+    }
     conn.SendResponse(BuildFetchResponse(frame.correlation_id, {}));
 }
 
@@ -253,6 +275,10 @@ void BrokerHandler::HandleCreateTopic(Connection &conn, const RequestFrame &fram
     std::vector<uint8_t> body;
     BinaryWriter w(body);
     int16_t rc = tm_.CreateTopic(topic, num_parts);
+    if (rc == err::kOk && metrics_) {
+        for (int32_t p = 0; p < num_parts; ++p)
+            metrics_->EnsurePartition(topic, p);
+    }
     if (rc == err::kOk && cs_) {
         // Register partition assignments in the cluster store.
         cs_->AssignNewTopic(topic, num_parts, replication_factor_, broker_timeout_);
@@ -485,7 +511,13 @@ void BrokerHandler::HandleOffsetFetch(Connection &conn, const RequestFrame &fram
         conn.SendResponse({frame.correlation_id, std::move(body)});
         return;
     }
-    uint64_t off = t->GetPartition(part_id).FetchCommittedOffset(group);
+    Partition &part = t->GetPartition(part_id);
+    uint64_t off = part.FetchCommittedOffset(group);
+    if (metrics_) {
+        uint64_t hwm = part.HighWatermark();
+        uint64_t lag = (hwm > off) ? (hwm - off) : 0;
+        metrics_->SetConsumerLag(group, topic, part_id, lag);
+    }
     w.WriteI16(err::kOk);
     w.WriteU64(off);
     conn.SendResponse({frame.correlation_id, std::move(body)});
@@ -497,8 +529,26 @@ void BrokerHandler::HandleOffsetFetch(Connection &conn, const RequestFrame &fram
 
 void BrokerHandler::BackgroundLoop()
 {
+    int snapshot_tick = 0;
+
     while (running_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // Snapshot per-partition gauges once per second (~every 100 iterations).
+        if (metrics_ && ++snapshot_tick >= 100) {
+            snapshot_tick = 0;
+            for (const auto &[name, num_parts] : tm_.ListTopics()) {
+                Topic *t = tm_.FindTopic(name);
+                if (!t)
+                    continue;
+                for (int p = 0; p < num_parts; ++p) {
+                    Partition &part = t->GetPartition(p);
+                    uint64_t hwm = part.HighWatermark();
+                    metrics_->SetPartitionLEO(name, p, part.NextOffset());
+                    metrics_->SetPartitionHWM(name, p, hwm == Partition::kUnreplicatedHWM ? part.NextOffset() : hwm);
+                }
+            }
+        }
 
         std::vector<PendingFetch> local;
         {
@@ -517,6 +567,15 @@ void BrokerHandler::BackgroundLoop()
 
             if (data_ready || timed_out) {
                 auto records = data_ready ? pf.partition->ReadBatch(pf.fetch_offset, pf.max_bytes) : std::vector<Record>{};
+                if (metrics_) {
+                    uint64_t out_bytes = 0;
+                    for (const auto &rec : records)
+                        out_bytes += rec.value.size();
+                    metrics_->messages_out_total.fetch_add(records.size(), std::memory_order_relaxed);
+                    metrics_->bytes_out_total.fetch_add(out_bytes, std::memory_order_relaxed);
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pf.start_time).count();
+                    metrics_->ObserveFetchLatency(static_cast<uint64_t>(ms));
+                }
                 post_fn_(pf.fd, BuildFetchResponse(pf.corr_id, records));
             }
             else {

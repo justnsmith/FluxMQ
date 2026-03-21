@@ -3,6 +3,7 @@
 #include "cluster_store.h"
 #include "connection.h"
 #include "group_coordinator.h"
+#include "metrics.h"
 #include "protocol.h"
 #include "replication_manager.h"
 #include "topic_manager.h"
@@ -34,7 +35,8 @@ class BrokerHandler
 {
   public:
     BrokerHandler(TopicManager &tm, GroupCoordinator &gc, PostFn post_fn, ClusterStore *cs = nullptr, ReplicationManager *rm = nullptr,
-                  int replication_factor = 1, std::chrono::milliseconds broker_timeout = std::chrono::milliseconds(15000));
+                  int replication_factor = 1, std::chrono::milliseconds broker_timeout = std::chrono::milliseconds(15000),
+                  MetricsRegistry *metrics = nullptr);
     ~BrokerHandler();
 
     BrokerHandler(const BrokerHandler &) = delete;
@@ -74,13 +76,15 @@ class BrokerHandler
         uint64_t fetch_offset;
         uint32_t max_bytes;
         std::chrono::steady_clock::time_point deadline;
+        std::chrono::steady_clock::time_point start_time; // for fetch latency metric
     };
 
     TopicManager &tm_;
     GroupCoordinator &gc_;
     PostFn post_fn_;
-    ClusterStore *cs_;       // null in standalone mode
-    ReplicationManager *rm_; // null in standalone mode
+    ClusterStore *cs_;         // null in standalone mode
+    ReplicationManager *rm_;   // null in standalone mode
+    MetricsRegistry *metrics_; // null if metrics disabled
     int replication_factor_;
     std::chrono::milliseconds broker_timeout_;
 

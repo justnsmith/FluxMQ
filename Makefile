@@ -17,10 +17,12 @@ NET_SRCS := src/buffer.cpp src/reactor.cpp src/connection.cpp src/server.cpp
 
 # Phase 3: broker core
 # Phase 6: replication
+# Phase 7: observability
 BROKER_SRCS := src/partition.cpp src/topic.cpp src/topic_manager.cpp \
                src/group_coordinator.cpp src/handler.cpp \
                src/cluster_store.cpp src/replica_client.cpp \
-               src/replication_manager.cpp src/leader_elector.cpp
+               src/replication_manager.cpp src/leader_elector.cpp \
+               src/metrics.cpp src/metrics_server.cpp
 
 # All library objects (shared by main binary and tests)
 LIB_SRCS := $(STORAGE_SRCS) $(NET_SRCS) $(BROKER_SRCS)
@@ -75,12 +77,18 @@ test: $(TEST_LOG) $(TEST_SERVER) $(TEST_BROKER)
 # ── Go SDK ────────────────────────────────────────────────────────────────────
 
 CLI         := $(BUILD)/fluxmq-cli
+BENCH       := $(BUILD)/fluxmq-bench
 SDK_DIR     := sdk
 
 $(CLI): $(TARGET) | $(BUILD)
 	cd $(SDK_DIR) && go build -o ../$(CLI) ./cmd/fluxmq
 
+$(BENCH): | $(BUILD)
+	cd $(SDK_DIR) && go build -o ../$(BENCH) ./cmd/fluxmq-bench
+
 sdk: $(CLI)
+
+bench: $(BENCH)
 
 sdk-test: $(TARGET)
 	cd $(SDK_DIR) && go test ./tests/ -timeout 120s
@@ -105,5 +113,5 @@ format:
 format-check:
 	./scripts/format.sh --check
 
-.PHONY: run test sdk sdk-test sdk-vet clean lint format format-check
+.PHONY: run test sdk bench sdk-test sdk-vet clean lint format format-check
 
