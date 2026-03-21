@@ -43,18 +43,42 @@ func (cc *ClusterClient) Close() {
 	cc.clients = make(map[int32]*Client)
 }
 
-// RefreshMetadata fetches v1 cluster metadata from the seed broker and
+// RefreshMetadata fetches v1 cluster metadata from a live broker and
 // updates the routing table and broker connections.
+// It tries the seed address first; if unreachable, it falls back to any
+// broker address known from the previous metadata fetch.
 func (cc *ClusterClient) RefreshMetadata() error {
-	seed, err := NewClient(cc.seedAddr)
-	if err != nil {
-		return fmt.Errorf("clusterClient: dial seed %s: %w", cc.seedAddr, err)
+	// Build candidate list: seed first, then all known broker addresses.
+	addrs := []string{cc.seedAddr}
+	cc.mu.RLock()
+	if cc.meta != nil {
+		for _, b := range cc.meta.Brokers {
+			candidate := fmt.Sprintf("%s:%d", b.Host, b.Port)
+			if candidate != cc.seedAddr {
+				addrs = append(addrs, candidate)
+			}
+		}
 	}
-	defer seed.Close()
+	cc.mu.RUnlock()
 
-	meta, err := seed.MetadataV1()
-	if err != nil {
-		return fmt.Errorf("clusterClient: MetadataV1: %w", err)
+	var meta *ClusterMetadata
+	var lastErr error
+	for _, addr := range addrs {
+		c, err := NewClient(addr)
+		if err != nil {
+			lastErr = fmt.Errorf("clusterClient: dial %s: %w", addr, err)
+			continue
+		}
+		meta, err = c.MetadataV1()
+		c.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("clusterClient: MetadataV1 from %s: %w", addr, err)
+			continue
+		}
+		break
+	}
+	if meta == nil {
+		return lastErr
 	}
 
 	cc.mu.Lock()
