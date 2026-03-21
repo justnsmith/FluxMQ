@@ -85,8 +85,17 @@ void LeaderElector::ElectionLoop()
                 if (asgn.leader_id != b.id)
                     continue;
 
-                // Is self the first ISR member?
-                if (asgn.isr.empty() || asgn.isr[0] != cs_.SelfId())
+                // Is self the first ISR member that is not the dead broker?
+                // (isr[0] is typically the current leader, which is dead here,
+                //  so we skip it when looking for the highest-priority survivor.)
+                int32_t first_survivor = -1;
+                for (int32_t m : asgn.isr) {
+                    if (m == b.id)
+                        continue;
+                    first_survivor = m;
+                    break;
+                }
+                if (first_survivor != cs_.SelfId())
                     continue;
 
                 // Attempt to take leadership.
@@ -103,8 +112,16 @@ void LeaderElector::ElectionLoop()
                 if (now_ms - leader_hb <= broker_timeout_.count())
                     continue; // Leader recovered in the meantime.
 
-                if (fresh->isr.empty() || fresh->isr[0] != cs_.SelfId())
-                    continue; // Not first ISR member anymore.
+                // Re-check: still the first surviving ISR member?
+                int32_t fresh_survivor = -1;
+                for (int32_t m : fresh->isr) {
+                    if (m == fresh->leader_id)
+                        continue;
+                    fresh_survivor = m;
+                    break;
+                }
+                if (fresh_survivor != cs_.SelfId())
+                    continue; // Not first surviving ISR member anymore.
 
                 // Claim leadership.
                 PartitionAssignment new_asgn = *fresh;
