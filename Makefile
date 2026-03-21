@@ -101,6 +101,24 @@ sdk-vet:
 ALL_OBJS := $(MAIN_OBJS) $(BUILD)/test_log.o $(BUILD)/test_server.o $(BUILD)/test_broker.o
 -include $(ALL_OBJS:.o=.d)
 
+# ── Docker ────────────────────────────────────────────────────────────────────
+
+DOCKER_IMAGE := fluxmq-broker
+
+docker-build:
+	docker build -t $(DOCKER_IMAGE) .
+
+docker-up:
+	docker compose up --build -d
+
+docker-down:
+	docker compose down -v
+
+docker-logs:
+	docker compose logs -f
+
+# ── Housekeeping ──────────────────────────────────────────────────────────────
+
 clean:
 	rm -rf $(BUILD)
 
@@ -113,5 +131,7 @@ format:
 format-check:
 	./scripts/format.sh --check
 
-.PHONY: run test sdk bench sdk-test sdk-vet clean lint format format-check
+.PHONY: run test sdk bench sdk-test sdk-vet \
+        docker-build docker-up docker-down docker-logs \
+        clean lint format format-check
 

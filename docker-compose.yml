@@ -1,0 +1,94 @@
+# FluxMQ 3-broker development cluster
+#
+# Each broker registers its Docker service name as its advertised host
+# (e.g. "broker1:9092").  Brokers resolve each other via Docker's internal
+# DNS, so inter-broker replication works automatically.
+#
+# External client access — connect to any broker via the mapped host ports:
+#   broker1  →  localhost:9092  (metrics: localhost:9093)
+#   broker2  →  localhost:9094  (metrics: localhost:9095)
+#   broker3  →  localhost:9096  (metrics: localhost:9097)
+#
+# Usage:
+#   docker compose up --build -d      # start cluster
+#   docker compose logs -f            # tail logs
+#   docker compose down -v            # teardown + remove volumes
+
+volumes:
+  cluster:        # shared coordination directory (broker registration, assignments)
+  broker1-data:
+  broker2-data:
+  broker3-data:
+
+services:
+  broker1:
+    build: .
+    image: fluxmq-broker
+    hostname: broker1
+    environment:
+      FLUXMQ_BROKER_ID: "1"
+      FLUXMQ_BROKER_HOST: "broker1"
+      FLUXMQ_PORT: "9092"
+      FLUXMQ_DATA_DIR: "/data"
+      FLUXMQ_CLUSTER_DIR: "/cluster"
+      FLUXMQ_REPLICATION_FACTOR: "3"
+    volumes:
+      - broker1-data:/data
+      - cluster:/cluster
+    ports:
+      - "9092:9092"   # binary protocol
+      - "9093:9093"   # metrics
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9093/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  broker2:
+    build: .
+    image: fluxmq-broker
+    hostname: broker2
+    environment:
+      FLUXMQ_BROKER_ID: "2"
+      FLUXMQ_BROKER_HOST: "broker2"
+      FLUXMQ_PORT: "9092"
+      FLUXMQ_DATA_DIR: "/data"
+      FLUXMQ_CLUSTER_DIR: "/cluster"
+      FLUXMQ_REPLICATION_FACTOR: "3"
+    volumes:
+      - broker2-data:/data
+      - cluster:/cluster
+    ports:
+      - "9094:9092"
+      - "9095:9093"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9093/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  broker3:
+    build: .
+    image: fluxmq-broker
+    hostname: broker3
+    environment:
+      FLUXMQ_BROKER_ID: "3"
+      FLUXMQ_BROKER_HOST: "broker3"
+      FLUXMQ_PORT: "9092"
+      FLUXMQ_DATA_DIR: "/data"
+      FLUXMQ_CLUSTER_DIR: "/cluster"
+      FLUXMQ_REPLICATION_FACTOR: "3"
+    volumes:
+      - broker3-data:/data
+      - cluster:/cluster
+    ports:
+      - "9096:9092"
+      - "9097:9093"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9093/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

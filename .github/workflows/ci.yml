@@ -71,3 +71,38 @@ jobs:
 
       - name: Go integration tests
         run: make sdk-test
+
+  docker:
+    name: Docker (build + cluster smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t fluxmq-broker .
+
+      - name: Start 3-broker cluster
+        run: docker compose up -d
+
+      - name: Wait for all brokers to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            healthy=$(docker compose ps | grep -c "healthy" || true)
+            echo "Healthy brokers: $healthy/3"
+            if [ "$healthy" -ge 3 ]; then exit 0; fi
+            sleep 2
+          done
+          echo "Cluster did not become healthy in time"
+          docker compose logs
+          exit 1
+
+      - name: Smoke test — metrics endpoints reachable
+        run: |
+          curl -sf http://localhost:9093/metrics | grep -q fluxmq_bytes_in_total
+          curl -sf http://localhost:9095/metrics | grep -q fluxmq_bytes_in_total
+          curl -sf http://localhost:9097/metrics | grep -q fluxmq_bytes_in_total
+          echo "All three broker metrics endpoints OK"
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
