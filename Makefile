@@ -69,6 +69,22 @@ test: $(TEST_LOG) $(TEST_SERVER) $(TEST_BROKER)
 	./$(TEST_SERVER)
 	./$(TEST_BROKER)
 
+# ── Go SDK ────────────────────────────────────────────────────────────────────
+
+CLI         := $(BUILD)/fluxmq-cli
+SDK_DIR     := sdk
+
+$(CLI): $(TARGET) | $(BUILD)
+	cd $(SDK_DIR) && go build -o ../$(CLI) ./cmd/fluxmq
+
+sdk: $(CLI)
+
+sdk-test: $(TARGET)
+	cd $(SDK_DIR) && go test ./tests/ -timeout 60s
+
+sdk-vet:
+	cd $(SDK_DIR) && go vet ./...
+
 clean:
 	rm -rf $(BUILD)
 
@@ -81,5 +97,5 @@ format:
 format-check:
 	./scripts/format.sh --check
 
-.PHONY: run test clean lint format format-check
+.PHONY: run test sdk sdk-test sdk-vet clean lint format format-check
 

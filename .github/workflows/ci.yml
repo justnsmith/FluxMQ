@@ -48,3 +48,26 @@ jobs:
 
       - name: Check formatting
         run: make format-check
+
+  go-sdk:
+    name: Go SDK (build + vet + integration tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go.sum
+
+      - name: Install C++ dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++
+
+      - name: Build broker binary
+        run: make
+
+      - name: Go vet
+        run: make sdk-vet
+
+      - name: Go integration tests
+        run: make sdk-test
