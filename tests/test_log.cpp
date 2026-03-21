@@ -16,47 +16,44 @@
 static int g_passed = 0;
 static int g_failed = 0;
 
-#define RUN_TEST(fn)                                                           \
-    do {                                                                       \
-        printf("  %-45s", #fn " ...");                                         \
-        fflush(stdout);                                                        \
-        try {                                                                  \
-            fn();                                                              \
-            printf("PASS\n");                                                  \
-            g_passed++;                                                        \
-        } catch (const std::exception &_ex) {                                 \
-            printf("FAIL: %s\n", _ex.what());                                 \
-            g_failed++;                                                        \
-        }                                                                      \
+#define RUN_TEST(fn)                                                                                                                       \
+    do {                                                                                                                                   \
+        printf("  %-45s", #fn " ...");                                                                                                     \
+        fflush(stdout);                                                                                                                    \
+        try {                                                                                                                              \
+            fn();                                                                                                                          \
+            printf("PASS\n");                                                                                                              \
+            g_passed++;                                                                                                                    \
+        } catch (const std::exception &_ex) {                                                                                              \
+            printf("FAIL: %s\n", _ex.what());                                                                                              \
+            g_failed++;                                                                                                                    \
+        }                                                                                                                                  \
     } while (0)
 
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        if (!(expr)) {                                                         \
-            throw std::runtime_error("CHECK failed at line " + std::to_string(__LINE__) + ": " #expr); \
-        }                                                                      \
+#define CHECK(expr)                                                                                                                        \
+    do {                                                                                                                                   \
+        if (!(expr)) {                                                                                                                     \
+            throw std::runtime_error("CHECK failed at line " + std::to_string(__LINE__) + ": " #expr);                                     \
+        }                                                                                                                                  \
     } while (0)
 
-#define CHECK_EQ(a, b)                                                         \
-    do {                                                                       \
-        auto _a = (a);                                                         \
-        auto _b = (b);                                                         \
-        if (_a != _b) {                                                        \
-            throw std::runtime_error(                                          \
-                "CHECK_EQ failed at line " + std::to_string(__LINE__) +       \
-                ": values differ");                                            \
-        }                                                                      \
+#define CHECK_EQ(a, b)                                                                                                                     \
+    do {                                                                                                                                   \
+        auto _a = (a);                                                                                                                     \
+        auto _b = (b);                                                                                                                     \
+        if (_a != _b) {                                                                                                                    \
+            throw std::runtime_error("CHECK_EQ failed at line " + std::to_string(__LINE__) + ": values differ");                           \
+        }                                                                                                                                  \
     } while (0)
 
-#define CHECK_STR_EQ(a, b)                                                     \
-    do {                                                                       \
-        std::string _sa = (a);                                                 \
-        std::string _sb = (b);                                                 \
-        if (_sa != _sb) {                                                      \
-            throw std::runtime_error(                                          \
-                "CHECK_STR_EQ failed at line " + std::to_string(__LINE__) +   \
-                ": got \"" + _sa + "\" expected \"" + _sb + "\"");            \
-        }                                                                      \
+#define CHECK_STR_EQ(a, b)                                                                                                                 \
+    do {                                                                                                                                   \
+        std::string _sa = (a);                                                                                                             \
+        std::string _sb = (b);                                                                                                             \
+        if (_sa != _sb) {                                                                                                                  \
+            throw std::runtime_error("CHECK_STR_EQ failed at line " + std::to_string(__LINE__) + ": got \"" + _sa + "\" expected \"" +     \
+                                     _sb + "\"");                                                                                          \
+        }                                                                                                                                  \
     } while (0)
 
 // ---------------------------------------------------------------------------
@@ -231,7 +228,8 @@ static void test_crc_corruption_detection()
     {
         auto log_path = std::filesystem::path(dir) / "00000000000000000000.log";
         FILE *f = fopen(log_path.c_str(), "r+b");
-        if (!f) throw std::runtime_error("cannot open log file for corruption");
+        if (!f)
+            throw std::runtime_error("cannot open log file for corruption");
         fseek(f, 27, SEEK_SET);
         char bad = 0xFF;
         fwrite(&bad, 1, 1, f);
@@ -242,7 +240,7 @@ static void test_crc_corruption_detection()
     {
         Log log(dir);
         CHECK_STR_EQ(as_string(log.Read(0)), "uncorrupted");
-        CHECK(log.Read(1).empty());  // CRC mismatch
+        CHECK(log.Read(1).empty()); // CRC mismatch
         CHECK_STR_EQ(as_string(log.Read(2)), "also-fine");
     }
 
@@ -291,7 +289,7 @@ static void test_delete_before()
     auto dir = make_temp_dir();
 
     // Force multiple segments with a small limit.
-    const uint64_t kSmallSeg = 200;  // fits ~2 records per segment (8+90=98 bytes each)
+    const uint64_t kSmallSeg = 200; // fits ~2 records per segment (8+90=98 bytes each)
 
     {
         Log log(dir, kSmallSeg);
@@ -303,7 +301,7 @@ static void test_delete_before()
 
         // Keep only the last two segments worth of data.
         size_t before = log.NumSegments();
-        log.DeleteBefore(4);  // delete segments entirely before offset 4
+        log.DeleteBefore(4); // delete segments entirely before offset 4
         CHECK(log.NumSegments() < before);
     }
 

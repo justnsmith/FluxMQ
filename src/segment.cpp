@@ -172,7 +172,12 @@ void Segment::LoadFromDisk()
 
     // Restore the byte counter: how many bytes have been written since the last
     // index entry.  The next Append() call uses this to decide when to index.
-    bytes_since_index_ = index_.empty() ? static_cast<uint32_t>(log_size_) : static_cast<uint32_t>(log_size_ - index_.back().position);
+    if (index_.empty()) {
+        bytes_since_index_ = static_cast<uint32_t>(log_size_);
+    }
+    else {
+        bytes_since_index_ = static_cast<uint32_t>(log_size_ - index_.back().position);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +202,10 @@ std::pair<uint64_t, uint32_t> Segment::FindNearestIndex(uint64_t target_offset) 
     if (index_.empty())
         return {UINT64_MAX, UINT32_MAX};
 
-    // upper_bound gives the first entry with .offset > target_offset
-    auto it =
-        std::upper_bound(index_.begin(), index_.end(), target_offset, [](uint64_t val, const IndexEntry &e) { return val < e.offset; });
+    // upper_bound gives the first entry with .offset > target_offset.
+    // The comparator is extracted to avoid formatting edge cases near ColumnLimit.
+    auto cmp = [](uint64_t val, const IndexEntry &e) { return val < e.offset; };
+    auto it = std::upper_bound(index_.begin(), index_.end(), target_offset, cmp);
 
     if (it == index_.begin())
         return {UINT64_MAX, UINT32_MAX}; // all entries are > target

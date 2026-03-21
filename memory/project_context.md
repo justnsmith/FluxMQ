@@ -9,6 +9,7 @@ It is a resume project demonstrating different primitives from an existing KV st
 
 ## Current State
 
+**Phase 2 (Network Layer) — COMPLETE as of 2026-03-20**
 **Phase 1 (Storage Engine) — COMPLETE as of 2026-03-20**
 
 Implemented files:
@@ -35,12 +36,27 @@ Key design decisions locked in:
 - 100K × 1024-byte records: **~115K msg/s, ~112 MB/s**
 - These are limited by 3 pwrite() syscalls per record; Phase 3 batching will improve this significantly.
 
+## Phase 2 Benchmark Numbers (macOS, loopback, single connection, ping-pong)
+
+- 200K × 100-byte requests: **~52K req/s, ~5 MB/s**
+- 50K × 1KB requests: **~22K req/s, ~22 MB/s**
+- Single-connection synchronous (send→wait→send) — pipelining in the Go SDK will show much higher throughput
+
+## Phase 2 Key Decisions
+
+- Wire protocol: `[4B total_len][2B api_key][2B api_version][4B corr_id][payload]` (big-endian, Kafka-compatible)
+- Reactor: kqueue on macOS, epoll on Linux, abstracted behind `Reactor` class
+- `Connection`: frame parser state machine (kHeader → kBody), per-connection recv/send Buffer
+- Immediate flush on SendResponse(); EPOLLOUT only registered when socket buffer full (avoids busy-loop)
+- Stop mechanism: self-pipe wakes poll_fd on Stop() call (thread-safe)
+- `Server::WaitReady()` via `std::promise<uint16_t>` — blocks until bound (used in tests with port=0)
+
 ## Roadmap
 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Storage Engine (Segment + Log) | ✅ Done |
-| 2 | Network Layer (epoll reactor, binary protocol) | Not started |
+| 2 | Network Layer (epoll reactor, binary protocol) | ✅ Done |
 | 3 | Broker Core (produce/fetch paths) | Not started |
 | 4 | Go Client SDK + CLI | Not started |
 | 5 | Consumer Groups & Rebalancing | Not started |
