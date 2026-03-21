@@ -127,8 +127,7 @@ void LeaderElector::ElectionLoop()
                 PartitionAssignment new_asgn = *fresh;
                 new_asgn.leader_id = cs_.SelfId();
                 new_asgn.leader_epoch += 1;
-                new_asgn.isr.erase(std::remove(new_asgn.isr.begin(), new_asgn.isr.end(), fresh->leader_id),
-                                   new_asgn.isr.end());
+                new_asgn.isr.erase(std::remove(new_asgn.isr.begin(), new_asgn.isr.end(), fresh->leader_id), new_asgn.isr.end());
                 cs_.CommitAssignment(new_asgn);
 
                 std::cerr << "LeaderElector: claimed leadership for " << asgn.topic << "/" << asgn.partition << " (epoch "
