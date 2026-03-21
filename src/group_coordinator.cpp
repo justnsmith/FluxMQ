@@ -1,8 +1,24 @@
 #include "group_coordinator.h"
 
 #include <algorithm>
+#include <thread>
 
 using Clock = std::chrono::steady_clock;
+
+// ---------------------------------------------------------------------------
+// Constructor / Destructor
+// ---------------------------------------------------------------------------
+
+GroupCoordinator::GroupCoordinator(std::chrono::milliseconds session_timeout) : session_timeout_(session_timeout)
+{
+    reaper_thread_ = std::thread([this] { ReaperLoop(); });
+}
+
+GroupCoordinator::~GroupCoordinator()
+{
+    running_ = false;
+    reaper_thread_.join();
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -234,4 +250,67 @@ int16_t GroupCoordinator::Leave(std::string_view group_id, std::string_view memb
         g.pending_sync.clear();
     }
     return err::kOk;
+}
+
+// ---------------------------------------------------------------------------
+// EvictMember  (called with mu_ held)
+// ---------------------------------------------------------------------------
+
+void GroupCoordinator::EvictMember(GroupInfo &g, const std::string &mid)
+{
+    g.members.erase(mid);
+    g.rejoined.erase(mid);
+
+    if (g.members.empty()) {
+        g.state = GroupState::EMPTY;
+        g.generation_id = 0;
+        g.pending_sync.clear();
+        g.rejoined.clear();
+        return;
+    }
+
+    if (g.state == GroupState::REBALANCING) {
+        // Evicting a member that hadn't rejoined yet may allow the remaining
+        // members (who already rejoined) to transition to SYNCING.
+        if (g.rejoined.size() == g.members.size()) {
+            g.state = GroupState::SYNCING;
+            g.pending_sync.clear();
+        }
+    }
+    else {
+        // STABLE or SYNCING: trigger a new rebalance.
+        g.generation_id++;
+        g.state = GroupState::REBALANCING;
+        g.rejoined.clear();
+        g.pending_sync.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReaperLoop  (background thread)
+// ---------------------------------------------------------------------------
+
+void GroupCoordinator::ReaperLoop()
+{
+    while (running_) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!running_)
+            break;
+
+        auto now = Clock::now();
+        std::lock_guard lock(mu_);
+
+        for (auto &[group_id, g] : groups_) {
+            if (g.state == GroupState::EMPTY)
+                continue;
+
+            std::vector<std::string> to_evict;
+            for (auto &[mid, info] : g.members) {
+                if (now - info.last_heartbeat > session_timeout_)
+                    to_evict.push_back(mid);
+            }
+            for (const auto &mid : to_evict)
+                EvictMember(g, mid);
+        }
+    }
 }

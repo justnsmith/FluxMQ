@@ -3,6 +3,7 @@
 #include "server.h"
 #include "topic_manager.h"
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -15,6 +16,7 @@ int main(int argc, char *argv[])
 {
     uint16_t port = 9092;
     std::string data_dir = "/tmp/fluxmq_data";
+    int session_timeout_ms = 10000;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -22,12 +24,15 @@ int main(int argc, char *argv[])
             port = static_cast<uint16_t>(std::stoi(arg.substr(7)));
         else if (arg.rfind("--data-dir=", 0) == 0)
             data_dir = arg.substr(11);
+        else if (arg.rfind("--session-timeout-ms=", 0) == 0)
+            session_timeout_ms = std::stoi(arg.substr(21));
     }
 
     std::filesystem::create_directories(data_dir);
 
     TopicManager tm(data_dir);
-    GroupCoordinator gc;
+    auto gc_timeout = std::chrono::milliseconds(session_timeout_ms);
+    GroupCoordinator gc(gc_timeout);
 
     // Break the circular dependency (BrokerHandler ↔ Server) using a deferred
     // pointer: broker captures &srv by reference, but srv is only dereferenced

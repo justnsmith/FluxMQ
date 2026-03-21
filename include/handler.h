@@ -49,6 +49,7 @@ class BrokerHandler
     void HandleHeartbeat(Connection &conn, const RequestFrame &frame);
     void HandleOffsetCommit(Connection &conn, const RequestFrame &frame);
     void HandleOffsetFetch(Connection &conn, const RequestFrame &frame);
+    void HandleLeaveGroup(Connection &conn, const RequestFrame &frame);
 
     // Encode a FETCH response from a vector of records.
     static ResponseFrame BuildFetchResponse(uint32_t corr_id, const std::vector<Record> &records);

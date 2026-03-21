@@ -19,6 +19,7 @@ inline constexpr uint16_t kSyncGroup = 5;
 inline constexpr uint16_t kHeartbeat = 6;
 inline constexpr uint16_t kOffsetCommit = 7;
 inline constexpr uint16_t kOffsetFetch = 8;
+inline constexpr uint16_t kLeaveGroup = 9;
 } // namespace api
 
 // ─── Frame types ──────────────────────────────────────────────────────────────

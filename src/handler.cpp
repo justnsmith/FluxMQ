@@ -59,6 +59,9 @@ void BrokerHandler::Handle(Connection &conn, RequestFrame frame)
         case api::kOffsetFetch:
             HandleOffsetFetch(conn, frame);
             break;
+        case api::kLeaveGroup:
+            HandleLeaveGroup(conn, frame);
+            break;
         default: {
             // Unknown API key — return a generic error.
             std::vector<uint8_t> body;
@@ -429,4 +432,21 @@ void BrokerHandler::BackgroundLoop()
                 pending_fetches_.push_back(std::move(pf));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LEAVE_GROUP  request:  [2B group_len][group][2B member_len][member]
+// LEAVE_GROUP  response: [2B error]
+// ---------------------------------------------------------------------------
+
+void BrokerHandler::HandleLeaveGroup(Connection &conn, const RequestFrame &frame)
+{
+    BinaryReader r(frame.payload);
+    std::string group = r.ReadString();
+    std::string member = r.ReadString();
+
+    std::vector<uint8_t> body;
+    BinaryWriter w(body);
+    w.WriteI16(gc_.Leave(group, member));
+    conn.SendResponse({frame.correlation_id, std::move(body)});
 }

@@ -87,7 +87,8 @@ func startBrokerGlobal() (addr string, cleanup func()) {
 }
 
 // startBroker starts a broker for use inside a single test (for isolation).
-func startBroker(t testing.TB) (addr string, cleanup func()) {
+// extraArgs are appended to the broker command line (e.g. "--session-timeout-ms=3000").
+func startBroker(t testing.TB, extraArgs ...string) (addr string, cleanup func()) {
 	t.Helper()
 
 	if _, err := os.Stat(brokerBin); os.IsNotExist(err) {
@@ -103,10 +104,13 @@ func startBroker(t testing.TB) (addr string, cleanup func()) {
 		t.Fatalf("create temp stdout: %v", err)
 	}
 
-	cmd := exec.Command(brokerBin,
+	args := []string{
 		fmt.Sprintf("--port=%d", port),
 		fmt.Sprintf("--data-dir=%s", tmpDir),
-	)
+	}
+	args = append(args, extraArgs...)
+
+	cmd := exec.Command(brokerBin, args...)
 	cmd.Stdout = outFile
 	cmd.Stderr = os.Stderr
 
@@ -407,6 +411,229 @@ func TestOffsetCommitAndFetch(t *testing.T) {
 	}
 	if off != 3 {
 		t.Errorf("expected committed offset 3, got %d", off)
+	}
+}
+
+// TestThreeConsumers verifies that three consumers in a group share partitions
+// correctly using the RoundRobin strategy and receive all produced messages.
+func TestThreeConsumers(t *testing.T) {
+	addr, cleanup := startBroker(t)
+	defer cleanup()
+
+	client, err := fluxmq.NewClient(addr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("three-consumers")
+	const numPartitions = 6
+	if err := client.CreateTopic(topic, numPartitions); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Produce 5 messages to each of the 6 partitions = 30 total.
+	const msgsPerPartition = 5
+	for p := int32(0); p < numPartitions; p++ {
+		for i := 0; i < msgsPerPartition; i++ {
+			val := fmt.Sprintf("p%d-msg%d", p, i)
+			if _, _, err := client.Produce(topic, p, nil, []byte(val)); err != nil {
+				t.Fatalf("Produce p%d[%d]: %v", p, i, err)
+			}
+		}
+	}
+
+	// Start 3 consumers with RoundRobin assignment.
+	const numConsumers = 3
+	cfg := fluxmq.ConsumerConfig{
+		GroupID:     uniqueTopic("group"), // unique group so no leftover offsets
+		Strategy:    fluxmq.StrategyRoundRobin,
+		MaxWaitMs:   500,
+		MaxBytes:    1 * 1024 * 1024,
+		HeartbeatMs: time.Second,
+	}
+
+	consumers := make([]*fluxmq.Consumer, numConsumers)
+	for i := range consumers {
+		c, err := fluxmq.NewConsumer(addr, cfg)
+		if err != nil {
+			t.Fatalf("NewConsumer[%d]: %v", i, err)
+		}
+		if err := c.Subscribe(topic); err != nil {
+			t.Fatalf("Subscribe[%d]: %v", i, err)
+		}
+		consumers[i] = c
+	}
+	defer func() {
+		for _, c := range consumers {
+			c.Close()
+		}
+	}()
+
+	// Collect all 30 messages across all consumers.
+	received := make(map[string]bool)
+	deadline := time.After(30 * time.Second)
+	total := numPartitions * msgsPerPartition
+
+	for len(received) < total {
+		// Fan-in from all consumer channels.
+		for _, c := range consumers {
+			select {
+			case msg := <-c.Messages():
+				received[string(msg.Value)] = true
+			default:
+			}
+		}
+		if len(received) < total {
+			select {
+			case <-deadline:
+				t.Fatalf("timed out: got %d/%d messages", len(received), total)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+}
+
+// TestConsumerGracefulRebalance verifies that when a consumer calls Close()
+// (which sends LeaveGroup), the remaining consumer immediately takes over the
+// departed consumer's partitions without waiting for a session timeout.
+func TestConsumerGracefulRebalance(t *testing.T) {
+	addr, cleanup := startBroker(t)
+	defer cleanup()
+
+	client, err := fluxmq.NewClient(addr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("graceful-rebalance")
+	if err := client.CreateTopic(topic, 2); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	group := uniqueTopic("gr-group")
+	cfg := fluxmq.ConsumerConfig{
+		GroupID:     group,
+		MaxWaitMs:   300,
+		MaxBytes:    1 * 1024 * 1024,
+		HeartbeatMs: time.Second,
+	}
+
+	// Start 2 consumers.
+	c1, _ := fluxmq.NewConsumer(addr, cfg)
+	c1.Subscribe(topic)
+
+	c2, _ := fluxmq.NewConsumer(addr, cfg)
+	c2.Subscribe(topic)
+
+	// Give both consumers time to join and stabilize.
+	time.Sleep(3 * time.Second)
+
+	// Produce to both partitions so c1 holds one and c2 holds the other.
+	for i := 0; i < 4; i++ {
+		client.Produce(topic, int32(i%2), nil, []byte(fmt.Sprintf("before-%d", i)))
+	}
+
+	// Close c1 gracefully (sends LeaveGroup).
+	c1.Close()
+
+	// c2 should rebalance and take over both partitions quickly (<5s).
+	// Produce to both partitions and verify c2 eventually receives them.
+	time.Sleep(2 * time.Second) // wait for rebalance
+
+	const N = 4
+	for i := 0; i < N; i++ {
+		client.Produce(topic, int32(i%2), nil, []byte(fmt.Sprintf("after-%d", i)))
+	}
+
+	received := make(map[string]bool)
+	deadline := time.After(15 * time.Second)
+	for len(received) < N {
+		select {
+		case msg := <-c2.Messages():
+			if strings.HasPrefix(string(msg.Value), "after-") {
+				received[string(msg.Value)] = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for post-rebalance messages; got %d/%d", len(received), N)
+		}
+	}
+	c2.Close()
+}
+
+// TestConsumerCrashRebalance verifies that when a consumer stops heartbeating
+// (simulating a crash), the broker's reaper evicts it after the session timeout
+// and the surviving consumer takes over all partitions.
+func TestConsumerCrashRebalance(t *testing.T) {
+	const sessionTimeoutMs = 3000
+
+	// Start a broker with a short session timeout so the test completes quickly.
+	addr, cleanup := startBroker(t, fmt.Sprintf("--session-timeout-ms=%d", sessionTimeoutMs))
+	defer cleanup()
+
+	client, err := fluxmq.NewClient(addr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("crash-rebalance")
+	if err := client.CreateTopic(topic, 2); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	group := uniqueTopic("crash-group")
+
+	// Start the real, surviving consumer.
+	survivor, err := fluxmq.NewConsumer(addr, fluxmq.ConsumerConfig{
+		GroupID:     group,
+		MaxWaitMs:   300,
+		MaxBytes:    1 * 1024 * 1024,
+		HeartbeatMs: 500 * time.Millisecond, // heartbeat faster than session timeout
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	survivor.Subscribe(topic)
+	defer survivor.Close()
+
+	// Give the survivor time to join and become stable as the sole member.
+	time.Sleep(time.Second)
+
+	// Simulate a crashed consumer: join the group using the raw Client API but
+	// never send a heartbeat. The broker will evict it after sessionTimeoutMs.
+	zombie, err := fluxmq.NewClient(addr)
+	if err != nil {
+		t.Fatalf("zombie NewClient: %v", err)
+	}
+	// Join without heartbeating. The survivor sees kRebalanceInProgress and
+	// re-joins. While waiting for "zombie" to rejoin, the reaper evicts it.
+	zombie.JoinGroup(group, topic, "zombie-member-that-never-heartbeats")
+	// Close the TCP connection without a LeaveGroup — broker doesn't know it's gone.
+	zombie.Close()
+
+	// Wait for: session timeout (3s) + rebalance latency (~2s) + buffer.
+	waitDur := time.Duration(sessionTimeoutMs)*time.Millisecond + 5*time.Second
+	time.Sleep(waitDur)
+
+	// Now produce to both partitions. The survivor must hold both.
+	const N = 6
+	for i := 0; i < N; i++ {
+		if _, _, err := client.Produce(topic, int32(i%2), nil, []byte(fmt.Sprintf("crash-msg-%d", i))); err != nil {
+			t.Fatalf("Produce[%d]: %v", i, err)
+		}
+	}
+
+	received := make(map[string]bool)
+	deadline := time.After(15 * time.Second)
+	for len(received) < N {
+		select {
+		case msg := <-survivor.Messages():
+			received[string(msg.Value)] = true
+		case <-deadline:
+			t.Fatalf("timed out: survivor got %d/%d messages after crash rebalance", len(received), N)
+		}
 	}
 }
 

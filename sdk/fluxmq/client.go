@@ -303,6 +303,25 @@ func (c *Client) OffsetFetch(group, topic string, partID int32) (uint64, error) 
 
 // ─── API key constants ────────────────────────────────────────────────────────
 
+// ─── LeaveGroup ───────────────────────────────────────────────────────────────
+// Request:  [2B group][2B member]
+// Response: [2B error]
+
+func (c *Client) LeaveGroup(group, memberID string) error {
+	var enc encoder
+	enc.str(group)
+	enc.str(memberID)
+
+	resp, err := c.conn.roundtrip(apiLeaveGroup, enc.bytes())
+	if err != nil {
+		return err
+	}
+	dec := newDecoder(resp)
+	return codeToError(dec.i16())
+}
+
+// ─── API key constants ────────────────────────────────────────────────────────
+
 const (
 	apiProduce      uint16 = 0
 	apiFetch        uint16 = 1
@@ -313,4 +332,5 @@ const (
 	apiHeartbeat    uint16 = 6
 	apiOffsetCommit uint16 = 7
 	apiOffsetFetch  uint16 = 8
+	apiLeaveGroup   uint16 = 9
 )

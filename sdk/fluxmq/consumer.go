@@ -10,10 +10,22 @@ import (
 	"time"
 )
 
+// AssignmentStrategy selects how partitions are distributed across group members.
+type AssignmentStrategy int
+
+const (
+	// StrategyRange assigns contiguous partition ranges per member (default).
+	StrategyRange AssignmentStrategy = iota
+	// StrategyRoundRobin distributes partitions evenly in round-robin order.
+	StrategyRoundRobin
+)
+
 // ConsumerConfig controls consumer group and fetch behavior.
 type ConsumerConfig struct {
 	// GroupID is the consumer group identifier.
 	GroupID string
+	// Strategy selects the partition assignment strategy. Default: StrategyRange.
+	Strategy AssignmentStrategy
 	// AutoCommit enables automatic offset committing.
 	AutoCommit bool
 	// CommitInterval is how often to auto-commit offsets. Default: 5s.
@@ -100,9 +112,15 @@ func (c *Consumer) CommitOffset(topic string, partID int32, offset uint64) error
 	return c.client.OffsetCommit(c.cfg.GroupID, topic, partID, offset)
 }
 
-// Close shuts down the consumer and waits for all goroutines to finish.
+// Close sends a LeaveGroup request (immediate rebalance for remaining members)
+// then shuts down all goroutines and the underlying connection.
 func (c *Consumer) Close() error {
 	c.closeOnce.Do(func() {
+		// Best-effort graceful leave — unblocks remaining members immediately
+		// instead of waiting for the session timeout.
+		if c.cfg.GroupID != "" && c.topic != "" {
+			_ = c.client.LeaveGroup(c.cfg.GroupID, c.memberID)
+		}
 		close(c.doneCh)
 		c.wg.Wait()
 		c.client.Close()
@@ -147,6 +165,19 @@ func (c *Consumer) rebalanceLoop() {
 
 		// Step 2: SyncGroup — compute assignments if leader.
 		assignments := c.computeAssignments(joinResult, numPartitions)
+
+		// If we're the leader but received an empty member list, the group
+		// hasn't reached SYNCING yet (still waiting for other members to
+		// rejoin). Re-join to pick up the full list once the state advances.
+		if joinResult.MemberID == joinResult.Leader && len(joinResult.Members) == 0 {
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-c.doneCh:
+				return
+			}
+			continue
+		}
+
 		partitions, err := c.syncWithRetry(joinResult.GenID, assignments)
 		if err != nil {
 			select {
@@ -239,28 +270,53 @@ func (c *Consumer) computeAssignments(result JoinResult, numPartitions int32) []
 	if result.MemberID != result.Leader {
 		return nil
 	}
-	// Range assignment: sort members, distribute partitions contiguously.
 	members := make([]string, len(result.Members))
 	copy(members, result.Members)
 	sort.Strings(members)
 
+	switch c.cfg.Strategy {
+	case StrategyRoundRobin:
+		return roundRobinAssign(members, numPartitions)
+	default:
+		return rangeAssign(members, numPartitions)
+	}
+}
+
+// rangeAssign distributes contiguous partition ranges across sorted members.
+// Member i gets partitions [start, end) where the range covers
+// ceil(numPartitions/nMembers) slots.
+func rangeAssign(members []string, numPartitions int32) []Assignment {
 	assignments := make([]Assignment, len(members))
 	for i := range assignments {
 		assignments[i] = Assignment{MemberID: members[i]}
 	}
-
 	nMembers := int32(len(members))
 	if nMembers == 0 {
 		return assignments
 	}
-
-	// ceil(numPartitions / nMembers) partitions per member.
 	for i := int32(0); i < numPartitions; i++ {
 		idx := i * nMembers / numPartitions
 		if idx >= nMembers {
 			idx = nMembers - 1
 		}
 		assignments[idx].Partitions = append(assignments[idx].Partitions, i)
+	}
+	return assignments
+}
+
+// roundRobinAssign distributes partitions evenly across sorted members by
+// cycling through them in order: partition 0 → member 0, partition 1 → member 1, …
+func roundRobinAssign(members []string, numPartitions int32) []Assignment {
+	assignments := make([]Assignment, len(members))
+	for i := range assignments {
+		assignments[i] = Assignment{MemberID: members[i]}
+	}
+	nMembers := int32(len(members))
+	if nMembers == 0 {
+		return assignments
+	}
+	for i := int32(0); i < numPartitions; i++ {
+		assignments[i%nMembers].Partitions = append(assignments[i%nMembers].Partitions, i)
 	}
 	return assignments
 }
