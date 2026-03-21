@@ -83,7 +83,7 @@ $(CLI): $(TARGET) | $(BUILD)
 sdk: $(CLI)
 
 sdk-test: $(TARGET)
-	cd $(SDK_DIR) && go test ./tests/ -timeout 60s
+	cd $(SDK_DIR) && go test ./tests/ -timeout 120s
 
 sdk-vet:
 	cd $(SDK_DIR) && go vet ./...

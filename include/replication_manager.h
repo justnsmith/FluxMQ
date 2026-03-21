@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using SteadyClock = std::chrono::steady_clock;
@@ -90,4 +91,8 @@ class ReplicationManager
 
     // Active follower threads.
     std::vector<std::thread> follower_threads_;
+
+    // Keys ("topic:partition") for which a FollowerLoop is running.
+    // Protected by states_mu_.
+    std::unordered_set<std::string> active_followers_;
 };

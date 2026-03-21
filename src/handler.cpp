@@ -149,6 +149,17 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
         actual_part = part_id;
     }
 
+    // In leader-only ISR mode (no in-sync followers), advance HWM immediately
+    // so that consumers can read newly produced records without waiting for
+    // the maintenance loop.
+    if (cs_) {
+        auto asgn = cs_->GetAssignment(topic, actual_part);
+        if (asgn && asgn->isr.size() == 1 && asgn->isr[0] == cs_->SelfId()) {
+            Partition &part = t->GetPartition(actual_part);
+            part.SetHighWatermark(part.NextOffset());
+        }
+    }
+
     w.WriteI16(err::kOk);
     w.WriteI32(actual_part);
     w.WriteU64(offset);

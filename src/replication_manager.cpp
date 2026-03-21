@@ -37,6 +37,11 @@ void ReplicationManager::Start()
 
     // Start follower threads for partitions where we are a replica but not leader.
     for (const auto &asgn : cs_.FollowerAssignments()) {
+        std::string key = asgn.topic + ":" + std::to_string(asgn.partition);
+        {
+            std::lock_guard lock(states_mu_);
+            active_followers_.insert(key);
+        }
         follower_threads_.emplace_back([this, asgn] { FollowerLoop(asgn.topic, asgn.partition); });
     }
 
@@ -174,13 +179,24 @@ void ReplicationManager::UpdateHWM(const std::string &topic, int32_t partition, 
 void ReplicationManager::MaintenanceLoop()
 {
     while (running_) {
-        // Sleep 5 seconds between ISR maintenance passes.
-        for (int i = 0; i < 50 && running_; ++i)
+        // Sleep 1 second between passes (short enough to pick up new topics quickly).
+        for (int i = 0; i < 10 && running_; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!running_)
             break;
 
         cs_.Reload();
+
+        // Start follower threads for any newly-assigned partitions (e.g. topics
+        // created after this broker started).
+        for (const auto &asgn : cs_.FollowerAssignments()) {
+            std::string key = asgn.topic + ":" + std::to_string(asgn.partition);
+            std::lock_guard lock(states_mu_);
+            if (active_followers_.find(key) == active_followers_.end()) {
+                active_followers_.insert(key);
+                follower_threads_.emplace_back([this, asgn] { FollowerLoop(asgn.topic, asgn.partition); });
+            }
+        }
 
         for (const auto &asgn : cs_.LeaderAssignments()) {
             std::string key = asgn.topic + ":" + std::to_string(asgn.partition);

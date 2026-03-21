@@ -20,7 +20,7 @@ class LeaderElector
 {
   public:
     LeaderElector(ClusterStore &cs, TopicManager &tm, ReplicationManager &rm, std::chrono::milliseconds broker_timeout,
-                  std::chrono::milliseconds check_interval = std::chrono::milliseconds(2000));
+                  std::chrono::milliseconds check_interval = std::chrono::milliseconds(500));
     ~LeaderElector();
 
     LeaderElector(const LeaderElector &) = delete;

@@ -663,8 +663,8 @@ func TestReplication(t *testing.T) {
 			"--broker-host=127.0.0.1",
 			fmt.Sprintf("--broker-id=%d", brokerID),
 			"--replication-factor=2",
-			"--replica-lag-ms=500",
-			"--broker-timeout-ms=4000",
+			"--replica-lag-ms=200",
+			"--broker-timeout-ms=2000",
 		)
 		cmd.Stdout = outFile
 		cmd.Stderr = os.Stderr
@@ -727,8 +727,9 @@ func TestReplication(t *testing.T) {
 		}
 	}
 
-	// Wait for replication to propagate to the follower.
-	time.Sleep(2 * time.Second)
+	// Wait for broker 2's MaintenanceLoop to discover the topic (~1s) and
+	// for all records to replicate (replica_lag_ms=200ms).
+	time.Sleep(3 * time.Second)
 
 	// Kill broker 1 (the leader since it created the topic).
 	cmd1.Process.Kill()
@@ -783,8 +784,8 @@ func TestFailover(t *testing.T) {
 			"--broker-host=127.0.0.1",
 			fmt.Sprintf("--broker-id=%d", brokerID),
 			"--replication-factor=2",
-			"--replica-lag-ms=500",
-			"--broker-timeout-ms=4000",
+			"--replica-lag-ms=200",
+			"--broker-timeout-ms=2000",
 		)
 		cmd.Stdout = outFile
 		cmd.Stderr = os.Stderr
@@ -851,8 +852,9 @@ func TestFailover(t *testing.T) {
 		}
 	}
 
-	// Wait for replication to propagate.
-	time.Sleep(2 * time.Second)
+	// Wait for broker 2's MaintenanceLoop to discover the topic (~1s) and
+	// for all records to replicate (replica_lag_ms=200ms).
+	time.Sleep(3 * time.Second)
 
 	// Kill broker 1 (original leader).
 	cleanup1()

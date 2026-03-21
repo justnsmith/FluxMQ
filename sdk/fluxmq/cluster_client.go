@@ -86,19 +86,24 @@ func (cc *ClusterClient) RefreshMetadata() error {
 
 	cc.meta = meta
 
-	// Ensure we have a connection to every broker listed in metadata.
+	// Ensure we have a live connection to every broker listed in metadata.
 	liveIDs := make(map[int32]struct{})
 	for _, b := range meta.Brokers {
 		liveIDs[b.ID] = struct{}{}
-		if _, ok := cc.clients[b.ID]; !ok {
-			addr := fmt.Sprintf("%s:%d", b.Host, b.Port)
-			c, err := NewClient(addr)
-			if err != nil {
-				// Non-fatal: the broker may be momentarily unavailable.
-				continue
-			}
-			cc.clients[b.ID] = c
+		existing, ok := cc.clients[b.ID]
+		if ok && existing.IsAlive() {
+			continue // reuse
 		}
+		if ok {
+			existing.Close()
+		}
+		addr := fmt.Sprintf("%s:%d", b.Host, b.Port)
+		c, err := NewClient(addr)
+		if err != nil {
+			// Non-fatal: the broker may be momentarily unavailable.
+			continue
+		}
+		cc.clients[b.ID] = c
 	}
 	// Remove connections to brokers that are no longer in the metadata.
 	for id, c := range cc.clients {
@@ -129,7 +134,7 @@ func (cc *ClusterClient) ClientFor(topic string, partID int32) (*Client, error) 
 	client := cc.clients[leaderID]
 	cc.mu.RUnlock()
 
-	if ok && client != nil {
+	if ok && client != nil && client.IsAlive() {
 		return client, nil
 	}
 
@@ -143,7 +148,7 @@ func (cc *ClusterClient) ClientFor(topic string, partID int32) (*Client, error) 
 	client = cc.clients[leaderID]
 	cc.mu.RUnlock()
 
-	if !ok || client == nil {
+	if !ok || client == nil || !client.IsAlive() {
 		return nil, fmt.Errorf("clusterClient: no leader found for %s/%d", topic, partID)
 	}
 	return client, nil
@@ -158,7 +163,7 @@ func (cc *ClusterClient) Produce(topic string, partID int32, key, value []byte) 
 			return 0, 0, err
 		}
 		part, off, err := client.Produce(topic, partID, key, value)
-		if err == ErrNotLeader {
+		if isRetryableErr(err) {
 			cc.RefreshMetadata() //nolint:errcheck
 			continue
 		}
@@ -168,7 +173,7 @@ func (cc *ClusterClient) Produce(topic string, partID int32, key, value []byte) 
 }
 
 // Fetch routes a fetch request to the partition leader, retrying once on
-// ErrNotLeader.
+// ErrNotLeader or a connection error.
 func (cc *ClusterClient) Fetch(topic string, partID int32, offset uint64, maxBytes, maxWaitMs uint32) ([]Record, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		client, err := cc.ClientFor(topic, partID)
@@ -176,13 +181,26 @@ func (cc *ClusterClient) Fetch(topic string, partID int32, offset uint64, maxByt
 			return nil, err
 		}
 		records, err := client.Fetch(topic, partID, offset, maxBytes, maxWaitMs)
-		if err == ErrNotLeader {
+		if isRetryableErr(err) {
 			cc.RefreshMetadata() //nolint:errcheck
 			continue
 		}
 		return records, err
 	}
 	return nil, ErrNotLeader
+}
+
+// isRetryableErr returns true for errors that warrant a metadata refresh and retry.
+func isRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == ErrNotLeader {
+		return true
+	}
+	msg := err.Error()
+	return msg == "fluxmq: connection closed" ||
+		msg == "fluxmq: connection closed while waiting for response"
 }
 
 // WaitForLeader polls until every partition of the topic has a reachable leader
@@ -199,7 +217,7 @@ func (cc *ClusterClient) WaitForLeader(topic string, numParts int, timeout time.
 		for p := 0; p < numParts; p++ {
 			key := fmt.Sprintf("%s:%d", topic, p)
 			if lid, ok := cc.leaderOf[key]; ok {
-				if _, cok := cc.clients[lid]; cok {
+				if c, cok := cc.clients[lid]; cok && c.IsAlive() {
 					ready++
 				}
 			}

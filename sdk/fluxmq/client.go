@@ -75,6 +75,16 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// IsAlive reports whether the underlying TCP connection is still open.
+func (c *Client) IsAlive() bool {
+	select {
+	case <-c.conn.closed:
+		return false
+	default:
+		return true
+	}
+}
+
 // ─── CreateTopic ──────────────────────────────────────────────────────────────
 // Request:  [2B topic][4B num_parts]
 // Response: [2B error]
