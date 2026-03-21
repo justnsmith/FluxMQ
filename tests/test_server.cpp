@@ -60,7 +60,9 @@ static int connect_to(uint16_t port)
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    struct sockaddr_in addr{};
+    struct sockaddr_in addr
+    {
+    };
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);

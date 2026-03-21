@@ -148,7 +148,9 @@ std::vector<PollEvent> Reactor::Poll(int timeout_ms)
 #else
     static constexpr int kMaxEvents = 64;
     struct kevent events[kMaxEvents];
-    struct timespec ts{};
+    struct timespec ts
+    {
+    };
     struct timespec *tsp = nullptr;
     if (timeout_ms >= 0) {
         ts.tv_sec = timeout_ms / 1000;

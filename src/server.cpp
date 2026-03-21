@@ -22,7 +22,9 @@ static int set_nonblocking(int fd)
 
 static uint16_t get_bound_port(int fd)
 {
-    struct sockaddr_in addr{};
+    struct sockaddr_in addr
+    {
+    };
     socklen_t len = sizeof(addr);
     if (getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) < 0)
         return 0;
@@ -33,11 +35,14 @@ static uint16_t get_bound_port(int fd)
 
 Server::Server(RequestHandler handler) : handler_(std::move(handler))
 {
-    if (pipe(stop_pipe_) < 0) {
+    if (pipe(stop_pipe_) < 0)
         throw std::runtime_error(std::string("pipe: ") + strerror(errno));
-    }
+    if (pipe(notify_pipe_) < 0)
+        throw std::runtime_error(std::string("pipe: ") + strerror(errno));
     set_nonblocking(stop_pipe_[0]);
     set_nonblocking(stop_pipe_[1]);
+    set_nonblocking(notify_pipe_[0]);
+    set_nonblocking(notify_pipe_[1]);
 }
 
 Server::~Server()
@@ -51,6 +56,10 @@ Server::~Server()
         close(stop_pipe_[0]);
     if (stop_pipe_[1] >= 0)
         close(stop_pipe_[1]);
+    if (notify_pipe_[0] >= 0)
+        close(notify_pipe_[0]);
+    if (notify_pipe_[1] >= 0)
+        close(notify_pipe_[1]);
 }
 
 // ─── Run ──────────────────────────────────────────────────────────────────────
@@ -68,7 +77,9 @@ void Server::Run(uint16_t port)
     setsockopt(listen_fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     set_nonblocking(listen_fd_);
 
-    struct sockaddr_in addr{};
+    struct sockaddr_in addr
+    {
+    };
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
@@ -82,6 +93,7 @@ void Server::Run(uint16_t port)
 
     reactor_.Add(listen_fd_, /*read=*/true, /*write=*/false);
     reactor_.Add(stop_pipe_[0], /*read=*/true, /*write=*/false);
+    reactor_.Add(notify_pipe_[0], /*read=*/true, /*write=*/false);
 
     // Signal WaitReady() callers — the server is now accepting connections.
     ready_promise_.set_value(get_bound_port(listen_fd_));
@@ -93,7 +105,10 @@ void Server::Run(uint16_t port)
                 running_ = false;
                 break;
             }
-            if (ev.fd == listen_fd_) {
+            if (ev.fd == notify_pipe_[0]) {
+                DrainNotifyPipe();
+            }
+            else if (ev.fd == listen_fd_) {
                 AcceptNew();
             }
             else {
@@ -163,6 +178,42 @@ void Server::HandleEvent(const PollEvent &ev)
     else {
         // Keep EPOLLOUT registered only when there is pending data to send.
         reactor_.Modify(ev.fd, /*read=*/true, /*write=*/conn->WantWrite());
+    }
+}
+
+// ─── PostResponse ─────────────────────────────────────────────────────────────
+
+void Server::PostResponse(int fd, ResponseFrame resp)
+{
+    {
+        std::lock_guard lock(pending_mu_);
+        pending_responses_.emplace_back(fd, std::move(resp));
+    }
+    char b = 0;
+    (void)write(notify_pipe_[1], &b, sizeof(b));
+}
+
+// ─── DrainNotifyPipe ──────────────────────────────────────────────────────────
+
+void Server::DrainNotifyPipe()
+{
+    // Drain all bytes written by PostResponse() calls.
+    char buf[64];
+    while (read(notify_pipe_[0], buf, sizeof(buf)) > 0) {
+    }
+
+    // Process all queued responses under the lock, then deliver outside.
+    std::vector<std::pair<int, ResponseFrame>> batch;
+    {
+        std::lock_guard lock(pending_mu_);
+        batch.swap(pending_responses_);
+    }
+    for (auto &[fd, resp] : batch) {
+        auto it = connections_.find(fd);
+        if (it == connections_.end())
+            continue; // connection already closed — drop silently
+        it->second->SendResponse(resp);
+        reactor_.Modify(fd, /*read=*/true, /*write=*/it->second->WantWrite());
     }
 }
 

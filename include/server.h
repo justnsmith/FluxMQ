@@ -6,12 +6,12 @@
 #include <atomic>
 #include <cstdint>
 #include <future>
+#include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 // Single-threaded TCP server backed by an epoll (Linux) / kqueue (macOS) reactor.
-//
-// Request handling is synchronous on the I/O thread for Phase 2.  Phase 3 will
-// dispatch heavy work (produce / fetch) to a worker thread pool.
 //
 // Typical usage:
 //   Server srv(echo_handler);
@@ -20,6 +20,10 @@
 //   // ... send requests from another thread ...
 //   srv.Stop();
 //   t.join();
+//
+// PostResponse() is thread-safe and can be called from any thread (e.g., a
+// background long-poll worker).  The response is queued and delivered by the
+// reactor thread on the next wakeup via the notify pipe.
 class Server
 {
   public:
@@ -40,21 +44,33 @@ class Server
     // Returns the actual listening port (useful when port = 0 in tests).
     uint16_t WaitReady();
 
+    // Enqueue a response for delivery to the connection identified by fd.
+    // Thread-safe: can be called from background threads (e.g., long-poll worker).
+    void PostResponse(int fd, ResponseFrame resp);
+
   private:
     void AcceptNew();
     void HandleEvent(const PollEvent &ev);
     void CloseConn(int fd);
+    void DrainNotifyPipe();
 
     RequestHandler handler_;
     Reactor reactor_;
     int listen_fd_{-1};
 
-    // Self-pipe used by Stop() to wake epoll_wait / kevent.
+    // Self-pipe: Stop() writes here to break epoll_wait / kevent.
     int stop_pipe_[2]{-1, -1};
+
+    // Notify pipe: PostResponse() writes here to deliver async responses.
+    int notify_pipe_[2]{-1, -1};
 
     std::unordered_map<int, Connection *> connections_;
 
     std::atomic<bool> running_{false};
+
+    // Queue of pending async responses (guarded by pending_mu_).
+    std::mutex pending_mu_;
+    std::vector<std::pair<int, ResponseFrame>> pending_responses_;
 
     // Promise/future pair so WaitReady() can block until Run() has bound.
     std::promise<uint16_t> ready_promise_;

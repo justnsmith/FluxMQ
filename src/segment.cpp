@@ -111,7 +111,9 @@ void Segment::LoadFromDisk()
     // We mmap the entire file for a zero-copy bulk read into the index_ vector,
     // then immediately unmap — the data lives in the vector from this point on.
     {
-        struct stat ist{};
+        struct stat ist
+        {
+        };
         if (fstat(index_fd_, &ist) == 0 && ist.st_size > 0) {
             auto map_size = static_cast<size_t>(ist.st_size);
             void *mapped = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, index_fd_, 0);
@@ -126,7 +128,9 @@ void Segment::LoadFromDisk()
 
     // Step 2: Determine the current log file size.
     {
-        struct stat lst{};
+        struct stat lst
+        {
+        };
         if (fstat(log_fd_, &lst) != 0 || lst.st_size == 0) {
             next_offset_ = base_offset_;
             return;
