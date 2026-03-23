@@ -1540,8 +1540,7 @@ void test_idempotent_unknown_producer_id()
     CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
 
     // Use a PID that was never allocated.
-    send_request_versioned(fd, api::kProduce, 1, 2,
-                           make_produce_idempotent("idem-unknown", 0, "", "msg", 99999, 0, 0));
+    send_request_versioned(fd, api::kProduce, 1, 2, make_produce_idempotent("idem-unknown", 0, "", "msg", 99999, 0, 0));
     auto pr = decode_produce(recv_response(fd).second);
     CHECK_EQ(pr.error, err::kUnknownProducerId);
 
@@ -1562,9 +1561,9 @@ void test_idempotent_multiple_partitions()
     // Produce to partition 0 seq=0, partition 1 seq=0, partition 2 seq=0.
     // Sequence numbers are per (PID, partition).
     for (int32_t p = 0; p < 3; ++p) {
-        send_request_versioned(fd, api::kProduce, 1, 10 + p,
-                               make_produce_idempotent("idem-multi", p, "", "msg-p" + std::to_string(p),
-                                                       pid_resp.producer_id, pid_resp.epoch, 0));
+        send_request_versioned(
+            fd, api::kProduce, 1, 10 + p,
+            make_produce_idempotent("idem-multi", p, "", "msg-p" + std::to_string(p), pid_resp.producer_id, pid_resp.epoch, 0));
         auto pr = decode_produce(recv_response(fd).second);
         CHECK_EQ(pr.error, err::kOk);
         CHECK_EQ(pr.offset, static_cast<uint64_t>(0));
@@ -1572,9 +1571,9 @@ void test_idempotent_multiple_partitions()
 
     // Now produce seq=1 to each partition.
     for (int32_t p = 0; p < 3; ++p) {
-        send_request_versioned(fd, api::kProduce, 1, 20 + p,
-                               make_produce_idempotent("idem-multi", p, "", "msg-p" + std::to_string(p) + "-1",
-                                                       pid_resp.producer_id, pid_resp.epoch, 1));
+        send_request_versioned(
+            fd, api::kProduce, 1, 20 + p,
+            make_produce_idempotent("idem-multi", p, "", "msg-p" + std::to_string(p) + "-1", pid_resp.producer_id, pid_resp.epoch, 1));
         auto pr = decode_produce(recv_response(fd).second);
         CHECK_EQ(pr.error, err::kOk);
         CHECK_EQ(pr.offset, static_cast<uint64_t>(1));

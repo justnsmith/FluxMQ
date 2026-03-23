@@ -23,10 +23,10 @@ class ProducerStateManager
     // Result of a sequence check.
     enum class CheckResult
     {
-        kAccept,       // New, in-order sequence — proceed with append
-        kDuplicate,    // Same as last accepted sequence — return cached offset
-        kOutOfOrder,   // Sequence gap or regression
-        kUnknownPID,   // Producer ID not registered
+        kAccept,     // New, in-order sequence — proceed with append
+        kDuplicate,  // Same as last accepted sequence — return cached offset
+        kOutOfOrder, // Sequence gap or regression
+        kUnknownPID, // Producer ID not registered
     };
 
     struct CheckOutput
