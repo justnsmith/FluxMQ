@@ -26,6 +26,9 @@ var (
 	ErrTopicAlreadyExists  = &BrokerError{Code: 36, Message: "topic already exists"}
 	ErrInvalidRequest      = &BrokerError{Code: 42, Message: "invalid request"}
 	ErrFencedLeaderEpoch   = &BrokerError{Code: 74, Message: "fenced leader epoch"}
+	ErrDuplicateSequence   = &BrokerError{Code: 46, Message: "duplicate sequence number"}
+	ErrOutOfOrderSequence  = &BrokerError{Code: 47, Message: "out of order sequence number"}
+	ErrUnknownProducerId   = &BrokerError{Code: 48, Message: "unknown producer id"}
 )
 
 // codeToError maps an int16 error code to the corresponding typed error.
@@ -56,6 +59,12 @@ func codeToError(code int16) error {
 		return ErrTopicAlreadyExists
 	case 42:
 		return ErrInvalidRequest
+	case 46:
+		return ErrDuplicateSequence
+	case 47:
+		return ErrOutOfOrderSequence
+	case 48:
+		return ErrUnknownProducerId
 	case 74:
 		return ErrFencedLeaderEpoch
 	default:

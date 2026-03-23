@@ -3,6 +3,7 @@ package fluxmq
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,6 +21,12 @@ type ProducerConfig struct {
 	// Acks controls acknowledgement mode: 0 = fire-and-forget, 1 = wait for broker ack.
 	// Default: 1
 	Acks int
+	// Idempotent enables exactly-once semantics per producer session.
+	// When true, the producer allocates a unique ID from the broker and
+	// attaches monotonic sequence numbers to each produce request.
+	// The broker deduplicates retries so no message is written twice.
+	// Requires Acks=1 (forced automatically when Idempotent is set).
+	Idempotent bool
 }
 
 func (cfg *ProducerConfig) applyDefaults() {
@@ -31,6 +38,9 @@ func (cfg *ProducerConfig) applyDefaults() {
 	}
 	if cfg.MaxInFlight <= 0 {
 		cfg.MaxInFlight = 5
+	}
+	if cfg.Idempotent {
+		cfg.Acks = 1 // idempotent requires acks
 	}
 }
 
@@ -60,6 +70,11 @@ type Producer struct {
 	// closeFn, if non-nil, is called instead of client.Close (cluster mode).
 	closeFn func() error
 
+	// Idempotent producer state.
+	producerID    uint64
+	producerEpoch uint16
+	seqNums       sync.Map // partition (int32) → *atomic.Int32
+
 	mu      sync.Mutex
 	pending []pendingRecord
 	timer   *time.Timer
@@ -83,6 +98,15 @@ func NewProducer(addr string, cfg ProducerConfig) (*Producer, error) {
 		cfg:     cfg,
 		flushCh: make(chan []pendingRecord, 64),
 		doneCh:  make(chan struct{}),
+	}
+	if cfg.Idempotent {
+		pid, epoch, err := client.InitProducerId()
+		if err != nil {
+			client.Close()
+			return nil, fmt.Errorf("fluxmq: init producer id: %w", err)
+		}
+		p.producerID = pid
+		p.producerEpoch = epoch
 	}
 	p.wg.Add(1)
 	go p.flushWorker()
@@ -134,10 +158,22 @@ func (p *Producer) Send(topic string, key, value []byte) error {
 
 // SendSync sends a single record synchronously, bypassing the batcher.
 func (p *Producer) SendSync(topic string, partID int32, key, value []byte) (int32, uint64, error) {
+	if p.cfg.Idempotent && p.client != nil {
+		seq := p.nextSeqNum(partID)
+		return p.client.ProduceIdempotent(topic, partID, key, value,
+			p.producerID, p.producerEpoch, seq)
+	}
 	if p.clusterSend != nil {
 		return p.clusterSend(topic, partID, key, value)
 	}
 	return p.client.Produce(topic, partID, key, value)
+}
+
+// nextSeqNum returns and increments the sequence number for a partition.
+func (p *Producer) nextSeqNum(partID int32) int32 {
+	val, _ := p.seqNums.LoadOrStore(partID, &atomic.Int32{})
+	counter := val.(*atomic.Int32)
+	return counter.Add(1) - 1 // first call returns 0
 }
 
 // Flush forces any pending batch to be sent and waits for all in-flight acks
@@ -296,7 +332,11 @@ func (p *Producer) sendBatch(batch []pendingRecord) {
 			var part int32
 			var off uint64
 			var err error
-			if p.clusterSend != nil {
+			if p.cfg.Idempotent && p.client != nil {
+				seq := p.nextSeqNum(rec.partID)
+				part, off, err = p.client.ProduceIdempotent(rec.topic, rec.partID, rec.key, rec.val,
+					p.producerID, p.producerEpoch, seq)
+			} else if p.clusterSend != nil {
 				part, off, err = p.clusterSend(rec.topic, rec.partID, rec.key, rec.val)
 			} else {
 				part, off, err = p.client.Produce(rec.topic, rec.partID, rec.key, rec.val)

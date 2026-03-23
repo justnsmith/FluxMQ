@@ -21,8 +21,9 @@ FluxMQ is a distributed message queue built from scratch in C++20 and Go, inspir
 - Partitioned topics with leader-follower replication and ISR tracking
 - Automatic leader failover on heartbeat timeout
 - Consumer groups with cooperative rebalancing
+- Idempotent producer with sequence-number dedup (exactly-once per session)
 - Prometheus `/metrics` endpoint
-- Go client SDK with batching producer, channel-based consumer, and cluster-aware routing
+- Go client SDK with batching producer (idempotent mode), channel-based consumer, and cluster-aware routing
 - CLI (`fluxmq`) and benchmark tool (`fluxmq-bench`)
 - Docker Compose 3-broker dev cluster
 
@@ -55,6 +56,7 @@ FluxMQ is a distributed message queue built from scratch in C++20 and Go, inspir
 | ClusterStore | `cluster_store.cpp` | Broker registry + assignments via `flock` |
 | ReplicationManager | `replication_manager.cpp` | Follower loops, ISR, HWM |
 | LeaderElector | `leader_elector.cpp` | Detects dead brokers, claims leadership |
+| ProducerStateManager | `producer_state.h` | Idempotent producer dedup (PID + seq tracking) |
 | MetricsRegistry | `metrics.cpp` | Atomic counters/gauges/histogram |
 
 ## Build
@@ -171,6 +173,8 @@ Brokers communicate via Docker service names. External clients connect through t
 **Pull-based replication.** Followers fetch from the leader using the same Fetch API consumers use. Slow followers fall behind and get evicted from the ISR rather than blocking the leader.
 
 **File-based coordination.** `ClusterStore` uses `flock(2)` on shared files instead of ZooKeeper/etcd. Good enough for a dev cluster, trivially reproducible with a shared Docker volume.
+
+**Idempotent producer (exactly-once per session).** Each producer calls `InitProducerId` to get a unique (PID, epoch) pair. Every produce request carries a per-partition sequence number. The broker tracks the last accepted sequence for each (PID, partition) tuple — duplicates return the cached offset without re-appending, and sequence gaps are rejected. This is the same model Kafka uses (KIP-98) and guarantees no duplicates even when the client retries on network errors.
 
 ## License
 

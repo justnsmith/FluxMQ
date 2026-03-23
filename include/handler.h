@@ -4,6 +4,7 @@
 #include "connection.h"
 #include "group_coordinator.h"
 #include "metrics.h"
+#include "producer_state.h"
 #include "protocol.h"
 #include "replication_manager.h"
 #include "topic_manager.h"
@@ -62,6 +63,9 @@ class BrokerHandler
     void HandleReplicaFetch(Connection &conn, const RequestFrame &frame);
     void HandleLeaderEpoch(Connection &conn, const RequestFrame &frame);
 
+    // Idempotent producer API.
+    void HandleInitProducerId(Connection &conn, const RequestFrame &frame);
+
     // Encode a FETCH response from a vector of records.
     static ResponseFrame BuildFetchResponse(uint32_t corr_id, const std::vector<Record> &records);
 
@@ -90,6 +94,8 @@ class BrokerHandler
 
     std::mutex pending_mu_;
     std::vector<PendingFetch> pending_fetches_;
+
+    ProducerStateManager producer_state_;
 
     std::atomic<bool> running_{true};
     std::thread bg_thread_;

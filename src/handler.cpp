@@ -74,6 +74,9 @@ void BrokerHandler::Handle(Connection &conn, RequestFrame frame)
         case api::kLeaderEpoch:
             HandleLeaderEpoch(conn, frame);
             break;
+        case api::kInitProducerId:
+            HandleInitProducerId(conn, frame);
+            break;
         default: {
             // Unknown API key — return a generic error.
             std::vector<uint8_t> body;
@@ -92,8 +95,10 @@ void BrokerHandler::Handle(Connection &conn, RequestFrame frame)
 }
 
 // ---------------------------------------------------------------------------
-// PRODUCE  request:  [2B topic_len][topic][4B partition_id (−1=auto)][2B key_len][key][4B val_len][val]
-// PRODUCE  response: [2B error][4B partition_id][8B offset]
+// PRODUCE  v0 request:  [2B topic_len][topic][4B partition_id (−1=auto)][2B key_len][key][4B val_len][val]
+// PRODUCE  v1 request:  [2B topic_len][topic][4B partition_id (−1=auto)][2B key_len][key][4B val_len][val]
+//                        [8B producer_id][2B producer_epoch][4B sequence_num]
+// PRODUCE  response:     [2B error][4B partition_id][8B offset]
 // ---------------------------------------------------------------------------
 
 void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
@@ -103,6 +108,17 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
     int32_t part_id = r.ReadI32();
     auto key = r.ReadBytes(r.ReadU16());
     auto val = r.ReadBytes(r.ReadU32());
+
+    // v1: idempotent producer fields.
+    bool idempotent = (frame.api_version >= 1) && r.HasRemaining();
+    uint64_t producer_id = 0;
+    uint16_t producer_epoch = 0;
+    int32_t seq_num = 0;
+    if (idempotent) {
+        producer_id = r.ReadU64();
+        producer_epoch = r.ReadU16();
+        seq_num = static_cast<int32_t>(r.ReadI32());
+    }
 
     std::vector<uint8_t> body;
     BinaryWriter w(body);
@@ -128,6 +144,33 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
         }
     }
 
+    // Idempotent dedup check (must happen before append).
+    if (idempotent) {
+        auto check = producer_state_.Check(producer_id, producer_epoch, part_id, seq_num);
+        switch (check.result) {
+        case ProducerStateManager::CheckResult::kDuplicate:
+            w.WriteI16(err::kOk);
+            w.WriteI32(part_id);
+            w.WriteU64(check.cached_offset);
+            conn.SendResponse({frame.correlation_id, std::move(body)});
+            return;
+        case ProducerStateManager::CheckResult::kOutOfOrder:
+            w.WriteI16(err::kOutOfOrderSequence);
+            w.WriteI32(0);
+            w.WriteU64(0);
+            conn.SendResponse({frame.correlation_id, std::move(body)});
+            return;
+        case ProducerStateManager::CheckResult::kUnknownPID:
+            w.WriteI16(err::kUnknownProducerId);
+            w.WriteI32(0);
+            w.WriteU64(0);
+            conn.SendResponse({frame.correlation_id, std::move(body)});
+            return;
+        case ProducerStateManager::CheckResult::kAccept:
+            break; // proceed with append
+        }
+    }
+
     int actual_part;
     uint64_t offset;
 
@@ -147,6 +190,11 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
         }
         offset = t->GetPartition(part_id).Append(val.data(), val.size());
         actual_part = part_id;
+    }
+
+    // Record the sequence → offset mapping for future dedup.
+    if (idempotent) {
+        producer_state_.RecordAppend(producer_id, actual_part, seq_num, offset);
     }
 
     if (metrics_) {
@@ -742,5 +790,26 @@ void BrokerHandler::HandleLeaderEpoch(Connection &conn, const RequestFrame &fram
         w.WriteI32(leader_id);
         w.WriteU64(log_end);
     }
+    conn.SendResponse({frame.correlation_id, std::move(body)});
+}
+
+// ---------------------------------------------------------------------------
+// INIT_PRODUCER_ID  (API key 22) — allocate an idempotent producer ID
+//
+// request:  (empty)
+// response: [2B error][8B producer_id][2B producer_epoch]
+// ---------------------------------------------------------------------------
+
+void BrokerHandler::HandleInitProducerId(Connection &conn, const RequestFrame &frame)
+{
+    uint64_t pid = producer_state_.AllocateProducerId();
+    uint16_t epoch = 0;
+    producer_state_.RegisterProducer(pid, epoch);
+
+    std::vector<uint8_t> body;
+    BinaryWriter w(body);
+    w.WriteI16(err::kOk);
+    w.WriteU64(pid);
+    w.WriteU16(epoch);
     conn.SendResponse({frame.correlation_id, std::move(body)});
 }

@@ -1373,6 +1373,270 @@ static void test_pipelined_produce_fetch()
     close(fd);
 }
 
+// ─── Idempotent producer helpers ─────────────────────────────────────────────
+
+static void send_request_versioned(int fd, uint16_t api_key, uint16_t api_version, uint32_t corr_id,
+                                   const std::vector<uint8_t> &payload = {})
+{
+    RequestFrame req;
+    req.api_key = api_key;
+    req.api_version = api_version;
+    req.correlation_id = corr_id;
+    req.payload = payload;
+    auto encoded = EncodeRequest(req);
+    send_all(fd, encoded.data(), encoded.size());
+}
+
+struct InitPidResp
+{
+    int16_t error;
+    uint64_t producer_id;
+    uint16_t epoch;
+};
+static InitPidResp decode_init_pid(const std::vector<uint8_t> &payload)
+{
+    BinaryReader r(payload);
+    return {r.ReadI16(), r.ReadU64(), r.ReadU16()};
+}
+
+static std::vector<uint8_t> make_produce_idempotent(const std::string &topic, int32_t part_id, const std::string &key,
+                                                    const std::string &value, uint64_t pid, uint16_t epoch, int32_t seq)
+{
+    std::vector<uint8_t> body;
+    BinaryWriter w(body);
+    w.WriteString(topic);
+    w.WriteI32(part_id);
+    w.WriteU16(static_cast<uint16_t>(key.size()));
+    w.WriteBytes(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+    w.WriteU32(static_cast<uint32_t>(value.size()));
+    w.WriteBytes(reinterpret_cast<const uint8_t *>(value.data()), value.size());
+    w.WriteU64(pid);
+    w.WriteU16(epoch);
+    w.WriteI32(seq);
+    return body;
+}
+
+// ─── Idempotent producer tests ──────────────────────────────────────────────
+
+void test_init_producer_id()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    // Request a producer ID.
+    send_request(fd, api::kInitProducerId, 1);
+    auto resp = decode_init_pid(recv_response(fd).second);
+
+    CHECK_EQ(resp.error, err::kOk);
+    CHECK(resp.producer_id > 0);
+    CHECK_EQ(resp.epoch, static_cast<uint16_t>(0));
+
+    // Second call returns a different ID.
+    send_request(fd, api::kInitProducerId, 2);
+    auto resp2 = decode_init_pid(recv_response(fd).second);
+    CHECK_EQ(resp2.error, err::kOk);
+    CHECK(resp2.producer_id != resp.producer_id);
+
+    close(fd);
+}
+
+void test_idempotent_produce_basic()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    // Create topic.
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-test", 1));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    // Get PID.
+    send_request(fd, api::kInitProducerId, 2);
+    auto pid_resp = decode_init_pid(recv_response(fd).second);
+    CHECK_EQ(pid_resp.error, err::kOk);
+
+    // Produce with seq=0 (first message).
+    send_request_versioned(fd, api::kProduce, 1, 3,
+                           make_produce_idempotent("idem-test", 0, "", "msg-0", pid_resp.producer_id, pid_resp.epoch, 0));
+    auto pr = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr.error, err::kOk);
+    CHECK_EQ(pr.offset, static_cast<uint64_t>(0));
+
+    // Produce with seq=1 (second message).
+    send_request_versioned(fd, api::kProduce, 1, 4,
+                           make_produce_idempotent("idem-test", 0, "", "msg-1", pid_resp.producer_id, pid_resp.epoch, 1));
+    auto pr2 = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr2.error, err::kOk);
+    CHECK_EQ(pr2.offset, static_cast<uint64_t>(1));
+
+    close(fd);
+}
+
+void test_idempotent_duplicate_detection()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-dup", 1));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    send_request(fd, api::kInitProducerId, 2);
+    auto pid_resp = decode_init_pid(recv_response(fd).second);
+
+    // First produce: seq=0 → offset 0.
+    send_request_versioned(fd, api::kProduce, 1, 3,
+                           make_produce_idempotent("idem-dup", 0, "", "hello", pid_resp.producer_id, pid_resp.epoch, 0));
+    auto pr = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr.error, err::kOk);
+    CHECK_EQ(pr.offset, static_cast<uint64_t>(0));
+
+    // Duplicate: same seq=0 → should return same offset without re-appending.
+    send_request_versioned(fd, api::kProduce, 1, 4,
+                           make_produce_idempotent("idem-dup", 0, "", "hello", pid_resp.producer_id, pid_resp.epoch, 0));
+    auto pr2 = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr2.error, err::kOk);
+    CHECK_EQ(pr2.offset, static_cast<uint64_t>(0)); // same offset, not re-appended
+
+    // Verify only one message was written by fetching.
+    send_request(fd, api::kFetch, 5, make_fetch("idem-dup", 0, 0, 1024 * 1024, 0));
+    auto fr = decode_fetch(recv_response(fd).second);
+    CHECK_EQ(fr.records.size(), static_cast<size_t>(1));
+    CHECK_EQ(fr.records[0].value, "hello");
+
+    close(fd);
+}
+
+void test_idempotent_out_of_order()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-ooo", 1));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    send_request(fd, api::kInitProducerId, 2);
+    auto pid_resp = decode_init_pid(recv_response(fd).second);
+
+    // Produce seq=0.
+    send_request_versioned(fd, api::kProduce, 1, 3,
+                           make_produce_idempotent("idem-ooo", 0, "", "msg-0", pid_resp.producer_id, pid_resp.epoch, 0));
+    auto pr = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr.error, err::kOk);
+
+    // Skip seq=1, send seq=2 → out of order error.
+    send_request_versioned(fd, api::kProduce, 1, 4,
+                           make_produce_idempotent("idem-ooo", 0, "", "msg-2", pid_resp.producer_id, pid_resp.epoch, 2));
+    auto pr2 = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr2.error, err::kOutOfOrderSequence);
+
+    close(fd);
+}
+
+void test_idempotent_unknown_producer_id()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-unknown", 1));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    // Use a PID that was never allocated.
+    send_request_versioned(fd, api::kProduce, 1, 2,
+                           make_produce_idempotent("idem-unknown", 0, "", "msg", 99999, 0, 0));
+    auto pr = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr.error, err::kUnknownProducerId);
+
+    close(fd);
+}
+
+void test_idempotent_multiple_partitions()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-multi", 3));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    send_request(fd, api::kInitProducerId, 2);
+    auto pid_resp = decode_init_pid(recv_response(fd).second);
+
+    // Produce to partition 0 seq=0, partition 1 seq=0, partition 2 seq=0.
+    // Sequence numbers are per (PID, partition).
+    for (int32_t p = 0; p < 3; ++p) {
+        send_request_versioned(fd, api::kProduce, 1, 10 + p,
+                               make_produce_idempotent("idem-multi", p, "", "msg-p" + std::to_string(p),
+                                                       pid_resp.producer_id, pid_resp.epoch, 0));
+        auto pr = decode_produce(recv_response(fd).second);
+        CHECK_EQ(pr.error, err::kOk);
+        CHECK_EQ(pr.offset, static_cast<uint64_t>(0));
+    }
+
+    // Now produce seq=1 to each partition.
+    for (int32_t p = 0; p < 3; ++p) {
+        send_request_versioned(fd, api::kProduce, 1, 20 + p,
+                               make_produce_idempotent("idem-multi", p, "", "msg-p" + std::to_string(p) + "-1",
+                                                       pid_resp.producer_id, pid_resp.epoch, 1));
+        auto pr = decode_produce(recv_response(fd).second);
+        CHECK_EQ(pr.error, err::kOk);
+        CHECK_EQ(pr.offset, static_cast<uint64_t>(1));
+    }
+
+    close(fd);
+}
+
+void test_idempotent_v0_still_works()
+{
+    // Non-idempotent (v0) produce should still work as before.
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-v0", 1));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    // v0 produce — no PID/seq fields.
+    send_request(fd, api::kProduce, 2, make_produce("idem-v0", 0, "", "hello-v0"));
+    auto pr = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr.error, err::kOk);
+    CHECK_EQ(pr.offset, static_cast<uint64_t>(0));
+
+    // Can produce again with same payload — no dedup since v0.
+    send_request(fd, api::kProduce, 3, make_produce("idem-v0", 0, "", "hello-v0"));
+    auto pr2 = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr2.error, err::kOk);
+    CHECK_EQ(pr2.offset, static_cast<uint64_t>(1)); // new offset, not deduped
+
+    close(fd);
+}
+
+void test_idempotent_two_producers_independent()
+{
+    BrokerServer bs;
+    int fd = connect_to(bs.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem-2pid", 1));
+    CHECK_EQ(read_error(recv_response(fd).second), err::kOk);
+
+    // Allocate two independent producer IDs.
+    send_request(fd, api::kInitProducerId, 2);
+    auto pid1 = decode_init_pid(recv_response(fd).second);
+    send_request(fd, api::kInitProducerId, 3);
+    auto pid2 = decode_init_pid(recv_response(fd).second);
+    CHECK(pid1.producer_id != pid2.producer_id);
+
+    // Both can produce seq=0 independently.
+    send_request_versioned(fd, api::kProduce, 1, 10,
+                           make_produce_idempotent("idem-2pid", 0, "", "from-p1", pid1.producer_id, pid1.epoch, 0));
+    auto pr1 = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr1.error, err::kOk);
+
+    send_request_versioned(fd, api::kProduce, 1, 11,
+                           make_produce_idempotent("idem-2pid", 0, "", "from-p2", pid2.producer_id, pid2.epoch, 0));
+    auto pr2 = decode_produce(recv_response(fd).second);
+    CHECK_EQ(pr2.error, err::kOk);
+    CHECK(pr2.offset != pr1.offset); // different offsets in the log
+
+    close(fd);
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main()
@@ -1423,6 +1687,16 @@ int main()
     RUN_TEST(test_high_volume_produce_fetch);
     RUN_TEST(test_concurrent_produce_different_partitions);
     RUN_TEST(test_pipelined_produce_fetch);
+
+    // Idempotent producer
+    RUN_TEST(test_init_producer_id);
+    RUN_TEST(test_idempotent_produce_basic);
+    RUN_TEST(test_idempotent_duplicate_detection);
+    RUN_TEST(test_idempotent_out_of_order);
+    RUN_TEST(test_idempotent_unknown_producer_id);
+    RUN_TEST(test_idempotent_multiple_partitions);
+    RUN_TEST(test_idempotent_v0_still_works);
+    RUN_TEST(test_idempotent_two_producers_independent);
 
     printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed > 0 ? 1 : 0;

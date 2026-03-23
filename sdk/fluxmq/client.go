@@ -438,6 +438,61 @@ func (c *Client) LeaderEpoch(topic string, partID int32) (epoch, leaderID int32,
 	return epoch, leaderID, leo, nil
 }
 
+// ─── InitProducerId ───────────────────────────────────────────────────────────
+// Request:  (empty)
+// Response: [2B error][8B producer_id][2B producer_epoch]
+
+func (c *Client) InitProducerId() (pid uint64, epoch uint16, err error) {
+	resp, err := c.conn.roundtrip(apiInitProducerId, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	dec := newDecoder(resp)
+	code := dec.i16()
+	pid = dec.u64()
+	epoch = dec.u16()
+	if dec.err != nil {
+		return 0, 0, dec.err
+	}
+	if brokerErr := codeToError(code); brokerErr != nil {
+		return 0, 0, brokerErr
+	}
+	return pid, epoch, nil
+}
+
+// ─── ProduceIdempotent ────────────────────────────────────────────────────────
+// Request (v1): [2B topic][4B part_id][2B key_len][key][4B val_len][val]
+//               [8B producer_id][2B producer_epoch][4B sequence_num]
+// Response:     [2B error][4B part_id][8B offset]
+
+func (c *Client) ProduceIdempotent(topic string, partID int32, key, value []byte,
+	pid uint64, epoch uint16, seqNum int32) (actualPart int32, offset uint64, err error) {
+	var enc encoder
+	enc.str(topic)
+	enc.i32(partID)
+	enc.bytes16(key)
+	enc.bytes32(value)
+	enc.u64(pid)
+	enc.u16(epoch)
+	enc.i32(seqNum)
+
+	resp, err := c.conn.roundtripVersion(apiProduce, 1, enc.bytes())
+	if err != nil {
+		return 0, 0, err
+	}
+	dec := newDecoder(resp)
+	code := dec.i16()
+	actualPart = dec.i32()
+	offset = dec.u64()
+	if dec.err != nil {
+		return 0, 0, dec.err
+	}
+	if brokerErr := codeToError(code); brokerErr != nil {
+		return actualPart, offset, brokerErr
+	}
+	return actualPart, offset, nil
+}
+
 // ─── API key constants ────────────────────────────────────────────────────────
 
 // ─── LeaveGroup ───────────────────────────────────────────────────────────────
@@ -470,6 +525,7 @@ const (
 	apiOffsetCommit uint16 = 7
 	apiOffsetFetch  uint16 = 8
 	apiLeaveGroup   uint16 = 9
-	apiReplicaFetch uint16 = 10
-	apiLeaderEpoch  uint16 = 11
+	apiReplicaFetch    uint16 = 10
+	apiLeaderEpoch     uint16 = 11
+	apiInitProducerId  uint16 = 22
 )

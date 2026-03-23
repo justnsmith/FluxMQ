@@ -886,6 +886,139 @@ func TestFailover(t *testing.T) {
 	_ = cmd2
 }
 
+// ─── Idempotent producer tests ────────────────────────────────────────────────
+
+func TestIdempotentProducer(t *testing.T) {
+	client, err := fluxmq.NewClient(brokerAddr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("idempotent")
+	if err := client.CreateTopic(topic, 1); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Create an idempotent producer.
+	p, err := fluxmq.NewProducer(brokerAddr, fluxmq.ProducerConfig{
+		Idempotent: true,
+		Acks:       1,
+	})
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+
+	// Produce 10 messages synchronously.
+	const N = 10
+	for i := 0; i < N; i++ {
+		val := fmt.Sprintf("idem-msg-%d", i)
+		_, _, err := p.SendSync(topic, 0, nil, []byte(val))
+		if err != nil {
+			t.Fatalf("SendSync[%d]: %v", i, err)
+		}
+	}
+	p.Close()
+
+	// Fetch all and verify.
+	records, err := client.Fetch(topic, 0, 0, 10*1024*1024, 0)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(records) != N {
+		t.Fatalf("expected %d records, got %d", N, len(records))
+	}
+	for i, rec := range records {
+		expected := fmt.Sprintf("idem-msg-%d", i)
+		if string(rec.Value) != expected {
+			t.Errorf("record[%d]: got %q, want %q", i, string(rec.Value), expected)
+		}
+	}
+}
+
+func TestIdempotentDedup(t *testing.T) {
+	client, err := fluxmq.NewClient(brokerAddr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("idem-dedup")
+	if err := client.CreateTopic(topic, 1); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Allocate a PID and manually send duplicate sequence numbers.
+	pid, epoch, err := client.InitProducerId()
+	if err != nil {
+		t.Fatalf("InitProducerId: %v", err)
+	}
+
+	// First produce: seq=0.
+	part1, off1, err := client.ProduceIdempotent(topic, 0, nil, []byte("hello"), pid, epoch, 0)
+	if err != nil {
+		t.Fatalf("ProduceIdempotent[0]: %v", err)
+	}
+	if part1 != 0 || off1 != 0 {
+		t.Fatalf("expected part=0 off=0, got part=%d off=%d", part1, off1)
+	}
+
+	// Duplicate: same seq=0.
+	part2, off2, err := client.ProduceIdempotent(topic, 0, nil, []byte("hello"), pid, epoch, 0)
+	if err != nil {
+		t.Fatalf("ProduceIdempotent dup: %v (should succeed with cached offset)", err)
+	}
+	if off2 != off1 {
+		t.Fatalf("duplicate should return same offset %d, got %d", off1, off2)
+	}
+	_ = part2
+
+	// Verify only one record was written.
+	records, err := client.Fetch(topic, 0, 0, 10*1024*1024, 0)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record (dedup), got %d", len(records))
+	}
+}
+
+func TestIdempotentOutOfOrder(t *testing.T) {
+	client, err := fluxmq.NewClient(brokerAddr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("idem-ooo")
+	if err := client.CreateTopic(topic, 1); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	pid, epoch, err := client.InitProducerId()
+	if err != nil {
+		t.Fatalf("InitProducerId: %v", err)
+	}
+
+	// Produce seq=0.
+	if _, _, err := client.ProduceIdempotent(topic, 0, nil, []byte("msg-0"), pid, epoch, 0); err != nil {
+		t.Fatalf("ProduceIdempotent[0]: %v", err)
+	}
+
+	// Skip seq=1, try seq=2 → should fail.
+	_, _, err = client.ProduceIdempotent(topic, 0, nil, []byte("msg-2"), pid, epoch, 2)
+	if err == nil {
+		t.Fatal("expected out-of-order error, got nil")
+	}
+	brokerErr, ok := err.(*fluxmq.BrokerError)
+	if !ok {
+		t.Fatalf("expected BrokerError, got %T: %v", err, err)
+	}
+	if brokerErr.Code != 47 {
+		t.Fatalf("expected error code 47 (OutOfOrderSequence), got %d", brokerErr.Code)
+	}
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // containsString checks whether s contains substr.

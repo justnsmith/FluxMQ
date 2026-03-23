@@ -20,8 +20,9 @@ inline constexpr uint16_t kHeartbeat = 6;
 inline constexpr uint16_t kOffsetCommit = 7;
 inline constexpr uint16_t kOffsetFetch = 8;
 inline constexpr uint16_t kLeaveGroup = 9;
-inline constexpr uint16_t kReplicaFetch = 10; // follower → leader: pull replication
-inline constexpr uint16_t kLeaderEpoch = 11;  // query current leader epoch
+inline constexpr uint16_t kReplicaFetch = 10;    // follower → leader: pull replication
+inline constexpr uint16_t kLeaderEpoch = 11;     // query current leader epoch
+inline constexpr uint16_t kInitProducerId = 22;  // allocate idempotent producer ID
 } // namespace api
 
 // ─── Frame types ──────────────────────────────────────────────────────────────
