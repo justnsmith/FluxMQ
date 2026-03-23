@@ -11,6 +11,7 @@ FluxMQ is a distributed message queue built from scratch in C++20 and Go, inspir
 - [Benchmarking](#benchmarking)
 - [Metrics](#metrics)
 - [Docker](#docker)
+- [Terraform (AWS)](#terraform-aws)
 - [Design Notes](#design-notes)
 
 ## Features
@@ -34,11 +35,11 @@ FluxMQ is a distributed message queue built from scratch in C++20 and Go, inspir
 ┌──────────────────────────────────────────────────┐
 │                  FluxMQ Cluster                  │
 │                                                  │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐    │
-│  │ Broker 1 │◄──│ Broker 2 │◄──│ Broker 3 │    │
-│  │ (leader) │   │(follower)│   │(follower)│    │
-│  └──────────┘   └──────────┘   └──────────┘    │
-│         Shared ClusterStore (file-backed)        │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐      │
+│  │ Broker 1 │◄──│ Broker 2 │◄──│ Broker 3 │      │
+│  │ (leader) │   │(follower)│   │(follower)│      │
+│  └──────────┘   └──────────┘   └──────────┘      │
+│         Shared ClusterStore (file-backed)         │
 └──────────────────────────────────────────────────┘
         ▲ Produce                    │ Fetch
 ┌───────┴──────┐            ┌────────▼───────┐
@@ -164,6 +165,34 @@ docker compose down -v
 | broker3 | `localhost:9096` | `localhost:9097` |
 
 Brokers communicate via Docker service names. External clients connect through the mapped host ports.
+
+## Terraform (AWS)
+
+Deploy a 3-broker cluster on AWS with one command:
+
+```bash
+cd terraform/
+terraform init
+terraform plan  -var="ssh_key_name=my-key"
+terraform apply -var="ssh_key_name=my-key"
+```
+
+Infrastructure created:
+
+| Resource | Purpose |
+|---|---|
+| VPC + 3 subnets | One subnet per AZ for fault tolerance |
+| 3 EC2 instances (`t3.medium`) | One FluxMQ broker each, Docker-based |
+| EFS file system | Shared POSIX mount for `flock`-based cluster coordination |
+| Security group | Broker protocol (9092), metrics (9093), SSH (22), NFS (2049) |
+
+Each broker boots via `user_data`, installs Docker, mounts EFS at `/cluster`, builds the FluxMQ image, and starts a container with `--network host`. Brokers discover each other through the shared EFS directory — the same file-based coordination used in the Docker Compose cluster.
+
+```bash
+terraform output broker_endpoints    # ["1.2.3.4:9092", "5.6.7.8:9092", "9.10.11.12:9092"]
+terraform output metrics_endpoints   # Prometheus scrape targets
+terraform destroy                    # teardown
+```
 
 ## Design Notes
 
