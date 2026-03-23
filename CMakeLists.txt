@@ -7,4 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Build all components
 add_subdirectory(src)
-add_subdirectory(tests)
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests")
+    add_subdirectory(tests)
+endif()
