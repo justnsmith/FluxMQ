@@ -112,15 +112,23 @@ BROKER=localhost:9092
 ./build/fluxmq-cli --broker=$BROKER cluster info
 ```
 
-## Benchmarking
+## Benchmarks
+
+Single standalone broker on Apple M3 Pro, 256-byte messages, 4 producer threads:
+
+| Workload | Throughput | Latency (p50) | Latency (p99) |
+|---|---|---|---|
+| **Produce** (1M msgs) | 45,986 msg/sec · 11.2 MB/sec | 0.07 ms | 0.19 ms |
+| **Consume** (905K msgs) | 59,463 msg/sec · 14.5 MB/sec | — | — |
+| **End-to-end** (produce → consume) | 17,330 msg/sec · 4.4 MB/sec | 0.09 ms | 11.7 ms |
+
+Run your own:
 
 ```bash
-./build/fluxmq-bench produce --topic bench --msg-size 100 --num-msgs 1000000 --threads 4
-./build/fluxmq-bench consume --topic bench --group g --threads 4 --duration 30s
-./build/fluxmq-bench e2e    --topic bench --msg-size 100 --duration 30s
+./build/fluxmq-bench produce --topic bench --msg-size 256 --num-msgs 1000000 --threads 4
+./build/fluxmq-bench consume --topic bench --group g --threads 4 --duration 15s
+./build/fluxmq-bench e2e    --topic bench --msg-size 256 --duration 15s
 ```
-
-Output: throughput (msg/sec, MB/sec) and latency (p50/p95/p99/max).
 
 ## Metrics
 
