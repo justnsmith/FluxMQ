@@ -9,6 +9,10 @@
 #   broker2  →  localhost:9094  (metrics: localhost:9095)
 #   broker3  →  localhost:9096  (metrics: localhost:9097)
 #
+# Observability:
+#   Prometheus  →  localhost:9090
+#   Grafana     →  localhost:3000  (admin/admin)
+#
 # Usage:
 #   docker compose up --build -d      # start cluster
 #   docker compose logs -f            # tail logs
@@ -19,6 +23,8 @@ volumes:
   broker1-data:
   broker2-data:
   broker3-data:
+  prometheus-data:
+  grafana-data:
 
 services:
   broker1:
@@ -92,3 +98,35 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    hostname: prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      broker1:
+        condition: service_healthy
+      broker2:
+        condition: service_healthy
+      broker3:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    hostname: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/fluxmq.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

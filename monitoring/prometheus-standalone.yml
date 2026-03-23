@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "fluxmq"
+    static_configs:
+      - targets:
+          - "broker:9093"
+        labels:
+          cluster: "fluxmq-dev"
+          broker_id: "1"

@@ -1,0 +1,59 @@
+# FluxMQ observability stack (standalone broker + Prometheus + Grafana)
+#
+# Usage:
+#   docker compose -f docker-compose.monitoring.yml up --build -d
+#   open http://localhost:3000   (admin/admin)
+#   docker compose -f docker-compose.monitoring.yml down -v
+
+volumes:
+  broker-data:
+  prometheus-data:
+  grafana-data:
+
+services:
+  broker:
+    build: .
+    image: fluxmq-broker
+    hostname: broker
+    environment:
+      FLUXMQ_PORT: "9092"
+      FLUXMQ_DATA_DIR: "/data"
+    volumes:
+      - broker-data:/data
+    ports:
+      - "9092:9092"   # binary protocol
+      - "9093:9093"   # metrics
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9093/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    hostname: prometheus
+    volumes:
+      - ./monitoring/prometheus-standalone.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    hostname: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/fluxmq.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

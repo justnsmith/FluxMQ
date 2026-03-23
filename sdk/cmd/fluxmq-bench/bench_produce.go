@@ -42,7 +42,7 @@ func runProduce(cmd *cobra.Command, args []string) error {
 	}
 	if err := setup.CreateTopic(produceTopic, int32(produceThreads)); err != nil {
 		// Ignore topic-already-exists; surface other errors.
-		if e, ok := err.(*fluxmq.BrokerError); !ok || e.Code != 8 {
+		if e, ok := err.(*fluxmq.BrokerError); !ok || e.Code != 36 {
 			setup.Close()
 			return fmt.Errorf("create topic: %w", err)
 		}

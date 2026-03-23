@@ -52,7 +52,7 @@ func runE2E(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	if err := setup.CreateTopic(e2eTopic, 1); err != nil {
-		if e, ok := err.(*fluxmq.BrokerError); !ok || e.Code != 8 {
+		if e, ok := err.(*fluxmq.BrokerError); !ok || e.Code != 36 {
 			setup.Close()
 			return fmt.Errorf("create topic: %w", err)
 		}

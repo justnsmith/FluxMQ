@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "fluxmq"
+    static_configs:
+      - targets:
+          - "broker1:9093"
+          - "broker2:9093"
+          - "broker3:9093"
+        labels:
+          cluster: "fluxmq-dev"
+    # Re-label to extract broker_id from the target address.
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "broker(\\d+):.*"
+        target_label: "broker_id"
+        replacement: "$1"
