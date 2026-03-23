@@ -188,7 +188,7 @@ void BrokerHandler::HandleProduce(Connection &conn, const RequestFrame &frame)
             conn.SendResponse({frame.correlation_id, std::move(body)});
             return;
         }
-        offset = t->GetPartition(part_id).Append(val.data(), val.size());
+        offset = t->GetPartition(part_id).AppendKV(key.data(), key.size(), val.data(), val.size());
         actual_part = part_id;
     }
 
@@ -310,8 +310,9 @@ void BrokerHandler::HandleFetch(Connection &conn, const RequestFrame &frame)
 }
 
 // ---------------------------------------------------------------------------
-// CREATE_TOPIC  request:  [2B topic_len][topic][4B num_partitions]
-// CREATE_TOPIC  response: [2B error]
+// CREATE_TOPIC  v0 request:  [2B topic_len][topic][4B num_partitions]
+// CREATE_TOPIC  v1 request:  [2B topic_len][topic][4B num_partitions][1B cleanup_policy]
+// CREATE_TOPIC  response:    [2B error]
 // ---------------------------------------------------------------------------
 
 void BrokerHandler::HandleCreateTopic(Connection &conn, const RequestFrame &frame)
@@ -320,9 +321,15 @@ void BrokerHandler::HandleCreateTopic(Connection &conn, const RequestFrame &fram
     std::string topic = r.ReadString();
     int32_t num_parts = r.ReadI32();
 
+    CleanupPolicy policy = CleanupPolicy::kDelete;
+    if (frame.api_version >= 1 && r.HasRemaining()) {
+        auto raw = r.ReadU16(); // use uint16 for wire compat, only low byte matters
+        policy = (raw == 1) ? CleanupPolicy::kCompact : CleanupPolicy::kDelete;
+    }
+
     std::vector<uint8_t> body;
     BinaryWriter w(body);
-    int16_t rc = tm_.CreateTopic(topic, num_parts);
+    int16_t rc = tm_.CreateTopic(topic, num_parts, policy);
     if (rc == err::kOk && metrics_) {
         for (int32_t p = 0; p < num_parts; ++p)
             metrics_->EnsurePartition(topic, p);
@@ -578,9 +585,21 @@ void BrokerHandler::HandleOffsetFetch(Connection &conn, const RequestFrame &fram
 void BrokerHandler::BackgroundLoop()
 {
     int snapshot_tick = 0;
+    int compaction_tick = 0;
 
     while (running_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // Run log compaction every 30 seconds (~3000 iterations) for compact topics.
+        if (++compaction_tick >= 3000) {
+            compaction_tick = 0;
+            for (const auto &[name, num_parts] : tm_.ListTopics()) {
+                Topic *t = tm_.FindTopic(name);
+                if (t && t->Policy() == CleanupPolicy::kCompact) {
+                    t->CompactAll();
+                }
+            }
+        }
 
         // Snapshot per-partition gauges once per second (~every 100 iterations).
         if (metrics_ && ++snapshot_tick >= 100) {

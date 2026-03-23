@@ -50,6 +50,22 @@ class Log
 
     uint64_t NextOffset() const;
 
+    // Base offset of the first segment (earliest available offset).
+    uint64_t BaseOffset() const;
+
+    // Read all records from closed (non-active) segments.
+    // Each record is returned as raw bytes at its logical offset.
+    struct RawRecord
+    {
+        uint64_t offset;
+        std::vector<std::byte> data;
+    };
+    std::vector<RawRecord> ReadClosedSegments() const;
+
+    // Replace all closed segments with a single compacted segment containing
+    // the given records.  The active segment is left untouched.
+    void ReplaceClosedSegments(const std::vector<RawRecord> &records);
+
     size_t NumSegments() const
     {
         return segments_.size();

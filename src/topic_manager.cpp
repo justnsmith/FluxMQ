@@ -14,7 +14,7 @@ TopicManager::TopicManager(const std::filesystem::path &data_dir, uint64_t max_s
 
 // ---------------------------------------------------------------------------
 
-int16_t TopicManager::CreateTopic(std::string_view name, int num_partitions)
+int16_t TopicManager::CreateTopic(std::string_view name, int num_partitions, CleanupPolicy policy)
 {
     std::unique_lock lock(mu_);
     std::string key(name);
@@ -23,8 +23,9 @@ int16_t TopicManager::CreateTopic(std::string_view name, int num_partitions)
 
     auto topic_dir = data_dir_ / "topics" / key;
     std::filesystem::create_directories(topic_dir);
-    topics_[key] = std::make_unique<Topic>(key, num_partitions, topic_dir, max_seg_bytes_);
+    topics_[key] = std::make_unique<Topic>(key, num_partitions, topic_dir, max_seg_bytes_, policy);
     meta_[key] = num_partitions;
+    policy_[key] = policy;
     SaveMetadata();
     return 0; // err::kOk
 }
@@ -67,10 +68,22 @@ void TopicManager::LoadMetadata()
     std::ifstream f(path);
     std::string name;
     int np;
+    int policy_int;
     while (f >> name >> np) {
+        CleanupPolicy policy = CleanupPolicy::kDelete;
+        // Try to read the optional policy field (backward-compatible).
+        auto pos = f.tellg();
+        if (f >> policy_int) {
+            policy = static_cast<CleanupPolicy>(policy_int);
+        }
+        else {
+            f.clear();
+            f.seekg(pos);
+        }
         meta_[name] = np;
+        policy_[name] = policy;
         auto topic_dir = data_dir_ / "topics" / name;
-        topics_[name] = std::make_unique<Topic>(name, np, topic_dir, max_seg_bytes_);
+        topics_[name] = std::make_unique<Topic>(name, np, topic_dir, max_seg_bytes_, policy);
     }
 }
 
@@ -80,8 +93,11 @@ void TopicManager::SaveMetadata() const
     auto dst = data_dir_ / "meta" / "topics.txt";
     {
         std::ofstream f(tmp);
-        for (const auto &[name, np] : meta_)
-            f << name << " " << np << "\n";
+        for (const auto &[name, np] : meta_) {
+            auto pit = policy_.find(name);
+            int pol = pit != policy_.end() ? static_cast<int>(pit->second) : 0;
+            f << name << " " << np << " " << pol << "\n";
+        }
     }
     std::filesystem::rename(tmp, dst);
 }

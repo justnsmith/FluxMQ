@@ -102,6 +102,31 @@ func (c *Client) CreateTopic(name string, numPartitions int32) error {
 	return codeToError(dec.i16())
 }
 
+// CleanupPolicy controls how a topic's log segments are managed.
+type CleanupPolicy uint16
+
+const (
+	// CleanupDelete uses time-based retention (delete old segments).
+	CleanupDelete CleanupPolicy = 0
+	// CleanupCompact uses key-based compaction (keep latest value per key).
+	CleanupCompact CleanupPolicy = 1
+)
+
+// CreateTopicCompact creates a topic with a specific cleanup policy.
+func (c *Client) CreateTopicCompact(name string, numPartitions int32, policy CleanupPolicy) error {
+	var enc encoder
+	enc.str(name)
+	enc.i32(numPartitions)
+	enc.u16(uint16(policy))
+
+	resp, err := c.conn.roundtripVersion(apiCreateTopic, 1, enc.bytes())
+	if err != nil {
+		return err
+	}
+	dec := newDecoder(resp)
+	return codeToError(dec.i16())
+}
+
 // ─── Metadata v0 ──────────────────────────────────────────────────────────────
 // Request:  (empty)
 // Response: [4B num_topics][topics: 2B name + 4B num_parts]

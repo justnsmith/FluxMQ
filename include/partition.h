@@ -18,6 +18,7 @@
 struct Record
 {
     uint64_t offset{0};
+    std::vector<uint8_t> key;
     std::vector<uint8_t> value;
 };
 
@@ -31,8 +32,18 @@ class Partition
   public:
     Partition(const std::filesystem::path &dir, int id, uint64_t max_seg_bytes = kDefaultMaxSegmentBytes);
 
-    // Append value bytes; returns the assigned logical offset.
+    // Append value bytes (no key); returns the assigned logical offset.
     uint64_t Append(const uint8_t *data, size_t len);
+
+    // Append a key-value record; returns the assigned logical offset.
+    // The key is stored alongside the value for key-based log compaction.
+    uint64_t AppendKV(const uint8_t *key, size_t key_len, const uint8_t *value, size_t value_len);
+
+    // Run key-based log compaction on closed (non-active) segments.
+    // For each key, only the record with the highest offset is retained.
+    // Records with empty keys are always preserved (cannot be compacted).
+    // Returns the number of records removed.
+    size_t Compact();
 
     // Consumer-facing read: capped at HighWatermark() so consumers never see
     // data that hasn't been committed to all ISR members yet.

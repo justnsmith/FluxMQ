@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
+#include <unordered_map>
 
 Partition::Partition(const std::filesystem::path &dir, int id, uint64_t max_seg_bytes)
     : id_(id), log_(dir.string(), max_seg_bytes), offsets_dir_(dir / "consumer_offsets")
@@ -29,6 +30,114 @@ uint64_t Partition::Append(const uint8_t *data, size_t len)
 }
 
 // ---------------------------------------------------------------------------
+// AppendKV — encode key + value into a framed record
+// ---------------------------------------------------------------------------
+// On-disk payload format: [2B key_len][key_bytes][value_bytes]
+// This allows Compact() to extract keys for dedup.
+
+uint64_t Partition::AppendKV(const uint8_t *key, size_t key_len, const uint8_t *value, size_t value_len)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+
+    // Encode: [2B key_len][key][value]
+    size_t frame_len = 2 + key_len + value_len;
+    std::vector<std::byte> frame(frame_len);
+    auto kl = static_cast<uint16_t>(key_len);
+    frame[0] = static_cast<std::byte>(kl >> 8);
+    frame[1] = static_cast<std::byte>(kl & 0xFF);
+    if (key_len > 0) {
+        std::memcpy(frame.data() + 2, key, key_len);
+    }
+    if (value_len > 0) {
+        std::memcpy(frame.data() + 2 + key_len, value, value_len);
+    }
+
+    uint64_t offset = log_.Append(std::span<const std::byte>(frame));
+    cv_.notify_all();
+    return offset;
+}
+
+// ---------------------------------------------------------------------------
+// Compact — key-based log compaction on closed segments
+// ---------------------------------------------------------------------------
+
+size_t Partition::Compact()
+{
+    std::lock_guard<std::mutex> lock(mu_);
+
+    auto all_records = log_.ReadClosedSegments();
+    if (all_records.empty())
+        return 0;
+
+    // Build key → index-of-latest-record map.
+    // Records with empty keys are always kept.
+    std::unordered_map<std::string, size_t> latest; // key → index in all_records
+    for (size_t i = 0; i < all_records.size(); ++i) {
+        const auto &rec = all_records[i];
+        if (rec.data.size() < 2)
+            continue;
+
+        uint16_t kl =
+            (static_cast<uint16_t>(static_cast<uint8_t>(rec.data[0])) << 8) | static_cast<uint16_t>(static_cast<uint8_t>(rec.data[1]));
+
+        if (kl == 0)
+            continue; // null-key: always kept
+
+        if (2 + kl > rec.data.size())
+            continue; // malformed
+
+        std::string key(reinterpret_cast<const char *>(rec.data.data() + 2), kl);
+        latest[key] = i; // later offsets overwrite earlier ones
+    }
+
+    // Build the set of indices to keep.
+    std::vector<bool> keep(all_records.size(), false);
+    size_t keep_count = 0;
+
+    for (size_t i = 0; i < all_records.size(); ++i) {
+        const auto &rec = all_records[i];
+        if (rec.data.size() < 2) {
+            keep[i] = true;
+            keep_count++;
+            continue;
+        }
+
+        uint16_t kl =
+            (static_cast<uint16_t>(static_cast<uint8_t>(rec.data[0])) << 8) | static_cast<uint16_t>(static_cast<uint8_t>(rec.data[1]));
+
+        if (kl == 0) {
+            // Null-key record: always keep.
+            keep[i] = true;
+            keep_count++;
+        }
+        else {
+            std::string key(reinterpret_cast<const char *>(rec.data.data() + 2), kl);
+            auto it = latest.find(key);
+            if (it != latest.end() && it->second == i) {
+                keep[i] = true;
+                keep_count++;
+            }
+        }
+    }
+
+    size_t removed = all_records.size() - keep_count;
+    if (removed == 0)
+        return 0; // nothing to compact
+
+    // Build compacted record list (preserving order).
+    std::vector<Log::RawRecord> compacted;
+    compacted.reserve(keep_count);
+    for (size_t i = 0; i < all_records.size(); ++i) {
+        if (keep[i]) {
+            compacted.push_back(std::move(all_records[i]));
+        }
+    }
+
+    log_.ReplaceClosedSegments(compacted);
+    return removed;
+}
+
+// ---------------------------------------------------------------------------
 // ReadBatchUpTo (internal shared logic)
 // ---------------------------------------------------------------------------
 
@@ -49,8 +158,30 @@ std::vector<Record> Partition::ReadBatchUpTo(uint64_t fetch_offset, uint32_t max
 
         Record rec;
         rec.offset = cur;
-        rec.value.resize(raw.size());
-        std::memcpy(rec.value.data(), raw.data(), raw.size());
+
+        // Decode framed key-value record: [2B key_len][key][value]
+        // If the record is too small or was written by old-style Append()
+        // (which doesn't frame), treat the entire payload as value.
+        const auto *p = reinterpret_cast<const uint8_t *>(raw.data());
+        size_t raw_len = raw.size();
+
+        if (raw_len >= 2) {
+            uint16_t kl = (static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]);
+            if (2 + kl <= raw_len) {
+                // Valid framing.
+                rec.key.assign(p + 2, p + 2 + kl);
+                rec.value.assign(p + 2 + kl, p + raw_len);
+            }
+            else {
+                // Malformed or legacy record — treat as raw value.
+                rec.value.resize(raw_len);
+                std::memcpy(rec.value.data(), raw.data(), raw_len);
+            }
+        }
+        else {
+            rec.value.resize(raw_len);
+            std::memcpy(rec.value.data(), raw.data(), raw_len);
+        }
 
         result.push_back(std::move(rec));
         total += sz;

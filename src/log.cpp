@@ -163,3 +163,76 @@ uint64_t Log::NextOffset() const
         return 0;
     return segments_.back()->NextOffset();
 }
+
+// ---------------------------------------------------------------------------
+// BaseOffset
+// ---------------------------------------------------------------------------
+
+uint64_t Log::BaseOffset() const
+{
+    if (segments_.empty())
+        return 0;
+    return segments_.front()->BaseOffset();
+}
+
+// ---------------------------------------------------------------------------
+// ReadClosedSegments — read all records from non-active segments
+// ---------------------------------------------------------------------------
+
+std::vector<Log::RawRecord> Log::ReadClosedSegments() const
+{
+    std::vector<RawRecord> result;
+    if (segments_.size() <= 1)
+        return result; // only active segment (or empty)
+
+    // All segments except the last one are "closed".
+    for (size_t i = 0; i + 1 < segments_.size(); ++i) {
+        const auto &seg = segments_[i];
+        for (uint64_t off = seg->BaseOffset(); off < seg->NextOffset(); ++off) {
+            auto data = seg->Read(off);
+            if (!data.empty()) {
+                result.push_back({off, std::move(data)});
+            }
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// ReplaceClosedSegments — swap closed segments with compacted records
+// ---------------------------------------------------------------------------
+
+void Log::ReplaceClosedSegments(const std::vector<RawRecord> &records)
+{
+    if (segments_.size() <= 1)
+        return; // nothing to replace
+
+    // Determine the base offset for the compacted segment.
+    uint64_t compacted_base = segments_.front()->BaseOffset();
+
+    // Delete old closed segment files from disk and remove from vector.
+    // Keep only the active segment (last one).
+    auto active = std::move(segments_.back());
+    for (size_t i = 0; i + 1 < segments_.size(); ++i) {
+        const auto &seg = segments_[i];
+        // Build file paths and remove.
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%020" PRIu64, seg->BaseOffset());
+        auto base = dir_ / std::string(buf);
+        std::filesystem::remove(std::string(base) + ".log");
+        std::filesystem::remove(std::string(base) + ".index");
+    }
+    segments_.clear();
+
+    // Create a new segment and write the compacted records into it.
+    if (!records.empty()) {
+        auto compacted = std::make_unique<Segment>(dir_, compacted_base, max_segment_bytes_);
+        for (const auto &rec : records) {
+            compacted->Append(rec.data);
+        }
+        segments_.push_back(std::move(compacted));
+    }
+
+    // Restore the active segment at the end.
+    segments_.push_back(std::move(active));
+}

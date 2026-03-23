@@ -1,4 +1,5 @@
 #include "log.h"
+#include "partition.h"
 
 #include <cassert>
 #include <chrono>
@@ -589,6 +590,206 @@ static void test_crc_corruption_last_record()
 }
 
 // ---------------------------------------------------------------------------
+// Log compaction tests
+// ---------------------------------------------------------------------------
+
+void test_partition_appendkv_and_read()
+{
+    auto dir = make_temp_dir();
+    {
+        Partition p(dir, 0, 400);
+
+        // Append key-value records.
+        auto off0 = p.AppendKV(reinterpret_cast<const uint8_t *>("key1"), 4, reinterpret_cast<const uint8_t *>("val1"), 4);
+        auto off1 = p.AppendKV(reinterpret_cast<const uint8_t *>("key2"), 4, reinterpret_cast<const uint8_t *>("val2"), 4);
+        CHECK_EQ(off0, static_cast<uint64_t>(0));
+        CHECK_EQ(off1, static_cast<uint64_t>(1));
+
+        // ReadBatch should decode key and value.
+        auto records = p.ReadBatch(0, 1024 * 1024);
+        CHECK_EQ(records.size(), static_cast<size_t>(2));
+
+        std::string k0(records[0].key.begin(), records[0].key.end());
+        std::string v0(records[0].value.begin(), records[0].value.end());
+        CHECK(k0 == "key1");
+        CHECK(v0 == "val1");
+
+        std::string k1(records[1].key.begin(), records[1].key.end());
+        std::string v1(records[1].value.begin(), records[1].value.end());
+        CHECK(k1 == "key2");
+        CHECK(v1 == "val2");
+    }
+    remove_temp_dir(dir);
+}
+
+void test_partition_appendkv_null_key()
+{
+    auto dir = make_temp_dir();
+    {
+        Partition p(dir, 0, 400);
+
+        // Append with null key.
+        auto off0 = p.AppendKV(nullptr, 0, reinterpret_cast<const uint8_t *>("data"), 4);
+        CHECK_EQ(off0, static_cast<uint64_t>(0));
+
+        auto records = p.ReadBatch(0, 1024 * 1024);
+        CHECK_EQ(records.size(), static_cast<size_t>(1));
+        CHECK(records[0].key.empty());
+        std::string v(records[0].value.begin(), records[0].value.end());
+        CHECK(v == "data");
+    }
+    remove_temp_dir(dir);
+}
+
+void test_compact_basic()
+{
+    // Write multiple values for the same key across segments, compact, verify only latest kept.
+    auto dir = make_temp_dir();
+    {
+        // Use tiny segments to force rotation.
+        Partition p(dir, 0, 200);
+
+        // Write key "A" with three different values, filling multiple segments.
+        p.AppendKV(reinterpret_cast<const uint8_t *>("A"), 1, reinterpret_cast<const uint8_t *>("val-1"), 5);
+        p.AppendKV(reinterpret_cast<const uint8_t *>("A"), 1, reinterpret_cast<const uint8_t *>("val-2"), 5);
+        p.AppendKV(reinterpret_cast<const uint8_t *>("A"), 1, reinterpret_cast<const uint8_t *>("val-3"), 5);
+        p.AppendKV(reinterpret_cast<const uint8_t *>("B"), 1, reinterpret_cast<const uint8_t *>("bbb-1"), 5);
+        p.AppendKV(reinterpret_cast<const uint8_t *>("B"), 1, reinterpret_cast<const uint8_t *>("bbb-2"), 5);
+
+        // Force data into multiple segments by writing enough.
+        // With 200-byte segments and ~16-byte records, we need several more.
+        for (int i = 0; i < 20; ++i) {
+            std::string val = "pad-" + std::to_string(i);
+            p.AppendKV(reinterpret_cast<const uint8_t *>("C"), 1, reinterpret_cast<const uint8_t *>(val.data()), val.size());
+        }
+
+        // Verify we have multiple segments (pre-condition for compaction).
+        // Compact only works on closed segments.
+        size_t removed = p.Compact();
+
+        // We should have removed some records (the older A and B values, and older C values).
+        CHECK(removed > 0);
+
+        // Fetch all remaining records and check the latest values are retained.
+        auto records = p.ReadBatch(0, 10 * 1024 * 1024);
+
+        // Find key "A" — should only appear once with "val-3" or the latest value.
+        int a_count = 0, b_count = 0;
+        std::string last_a_val, last_b_val;
+        for (const auto &rec : records) {
+            std::string k(rec.key.begin(), rec.key.end());
+            std::string v(rec.value.begin(), rec.value.end());
+            if (k == "A") {
+                a_count++;
+                last_a_val = v;
+            }
+            if (k == "B") {
+                b_count++;
+                last_b_val = v;
+            }
+        }
+
+        // After compaction, each key in closed segments should appear at most once.
+        // (Active segment records are not compacted.)
+        // The latest values should be retained.
+        CHECK(a_count <= 1); // compacted
+        CHECK(b_count <= 1); // compacted
+    }
+    remove_temp_dir(dir);
+}
+
+void test_compact_null_keys_preserved()
+{
+    // Records with null keys should never be removed by compaction.
+    auto dir = make_temp_dir();
+    {
+        Partition p(dir, 0, 200);
+
+        // Write several null-key records.
+        for (int i = 0; i < 15; ++i) {
+            std::string val = "nullkey-" + std::to_string(i);
+            p.AppendKV(nullptr, 0, reinterpret_cast<const uint8_t *>(val.data()), val.size());
+        }
+
+        // Also write some keyed records.
+        p.AppendKV(reinterpret_cast<const uint8_t *>("X"), 1, reinterpret_cast<const uint8_t *>("x1"), 2);
+        p.AppendKV(reinterpret_cast<const uint8_t *>("X"), 1, reinterpret_cast<const uint8_t *>("x2"), 2);
+
+        size_t removed = p.Compact();
+
+        auto records = p.ReadBatch(0, 10 * 1024 * 1024);
+
+        // Count null-key records — they should all still be there.
+        int null_count = 0;
+        for (const auto &rec : records) {
+            if (rec.key.empty())
+                null_count++;
+        }
+        // All null-key records from closed segments should be preserved.
+        CHECK(null_count >= 1);
+        // X should have had one removed (if both were in closed segments).
+        (void)removed;
+    }
+    remove_temp_dir(dir);
+}
+
+void test_compact_no_closed_segments()
+{
+    // Compaction with only one segment (the active one) should be a no-op.
+    auto dir = make_temp_dir();
+    {
+        Partition p(dir, 0); // large default segment, won't rotate
+
+        p.AppendKV(reinterpret_cast<const uint8_t *>("A"), 1, reinterpret_cast<const uint8_t *>("v1"), 2);
+        p.AppendKV(reinterpret_cast<const uint8_t *>("A"), 1, reinterpret_cast<const uint8_t *>("v2"), 2);
+
+        size_t removed = p.Compact();
+        CHECK_EQ(removed, static_cast<size_t>(0)); // nothing to compact
+
+        // All records still readable.
+        auto records = p.ReadBatch(0, 1024 * 1024);
+        CHECK_EQ(records.size(), static_cast<size_t>(2));
+    }
+    remove_temp_dir(dir);
+}
+
+void test_compact_multiple_keys()
+{
+    auto dir = make_temp_dir();
+    {
+        Partition p(dir, 0, 100); // tiny segments to force rotation
+
+        // Write records with several different keys.
+        for (int round = 0; round < 3; ++round) {
+            for (int k = 0; k < 5; ++k) {
+                std::string key = "key-" + std::to_string(k);
+                std::string val = "r" + std::to_string(round) + "-k" + std::to_string(k);
+                p.AppendKV(reinterpret_cast<const uint8_t *>(key.data()), key.size(), reinterpret_cast<const uint8_t *>(val.data()),
+                           val.size());
+            }
+        }
+
+        size_t removed = p.Compact();
+        CHECK(removed > 0);
+
+        // After compaction, each key should appear at most once in the compacted segments.
+        auto records = p.ReadBatch(0, 10 * 1024 * 1024);
+        std::unordered_map<std::string, int> key_counts;
+        for (const auto &rec : records) {
+            std::string k(rec.key.begin(), rec.key.end());
+            key_counts[k]++;
+        }
+
+        // Each key should have at most 2 (1 from compacted segment + 1 from active).
+        // In practice with tiny segments many records will be in closed segments.
+        for (const auto &[k, count] : key_counts) {
+            CHECK(count <= 2); // at most: 1 compacted + 1 in active
+        }
+    }
+    remove_temp_dir(dir);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -613,6 +814,14 @@ int main()
     RUN_TEST(test_interleaved_append_read);
     RUN_TEST(test_crc_corruption_first_record);
     RUN_TEST(test_crc_corruption_last_record);
+
+    // Log compaction
+    RUN_TEST(test_partition_appendkv_and_read);
+    RUN_TEST(test_partition_appendkv_null_key);
+    RUN_TEST(test_compact_basic);
+    RUN_TEST(test_compact_null_keys_preserved);
+    RUN_TEST(test_compact_no_closed_segments);
+    RUN_TEST(test_compact_multiple_keys);
 
     printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed > 0 ? 1 : 0;

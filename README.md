@@ -22,6 +22,7 @@ FluxMQ is a distributed message queue built from scratch in C++20 and Go, inspir
 - Automatic leader failover on heartbeat timeout
 - Consumer groups with cooperative rebalancing
 - Idempotent producer with sequence-number dedup (exactly-once per session)
+- Key-based log compaction (keep latest value per key, like Kafka `cleanup.policy=compact`)
 - Prometheus `/metrics` endpoint
 - Go client SDK with batching producer (idempotent mode), channel-based consumer, and cluster-aware routing
 - CLI (`fluxmq`) and benchmark tool (`fluxmq-bench`)
@@ -175,6 +176,8 @@ Brokers communicate via Docker service names. External clients connect through t
 **File-based coordination.** `ClusterStore` uses `flock(2)` on shared files instead of ZooKeeper/etcd. Good enough for a dev cluster, trivially reproducible with a shared Docker volume.
 
 **Idempotent producer (exactly-once per session).** Each producer calls `InitProducerId` to get a unique (PID, epoch) pair. Every produce request carries a per-partition sequence number. The broker tracks the last accepted sequence for each (PID, partition) tuple — duplicates return the cached offset without re-appending, and sequence gaps are rejected. This is the same model Kafka uses (KIP-98) and guarantees no duplicates even when the client retries on network errors.
+
+**Key-based log compaction.** Topics can be created with `cleanup.policy=compact`. Records are stored with a `[2B key_len][key][value]` framing so the compaction process can extract keys. A background thread periodically scans closed (non-active) segments, builds a key→latest-offset map, and rewrites a single compacted segment keeping only the most recent value for each key. Records with null keys are always preserved. This is the same model Kafka uses for changelog topics and state stores.
 
 ## License
 

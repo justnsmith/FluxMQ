@@ -47,7 +47,8 @@ static uint32_t murmur3(const void *key, size_t len)
 // Topic
 // ---------------------------------------------------------------------------
 
-Topic::Topic(std::string name, int num_partitions, const std::filesystem::path &base_dir, uint64_t max_seg_bytes) : name_(std::move(name))
+Topic::Topic(std::string name, int num_partitions, const std::filesystem::path &base_dir, uint64_t max_seg_bytes, CleanupPolicy policy)
+    : name_(std::move(name)), policy_(policy)
 {
     for (int i = 0; i < num_partitions; ++i) {
         auto part_dir = base_dir / ("partition-" + std::to_string(i));
@@ -66,7 +67,7 @@ std::pair<int, uint64_t> Topic::Publish(const uint8_t *value, size_t value_len, 
         uint32_t h = murmur3(key, key_len);
         part_id = static_cast<int>(h % static_cast<uint32_t>(NumPartitions()));
     }
-    uint64_t offset = partitions_[part_id]->Append(value, value_len);
+    uint64_t offset = partitions_[part_id]->AppendKV(key, key_len, value, value_len);
     return {part_id, offset};
 }
 
@@ -82,4 +83,13 @@ const Partition &Topic::GetPartition(int id) const
     if (id < 0 || id >= NumPartitions())
         throw std::out_of_range("Topic::GetPartition: invalid id " + std::to_string(id));
     return *partitions_[id];
+}
+
+size_t Topic::CompactAll()
+{
+    size_t total = 0;
+    for (auto &p : partitions_) {
+        total += p->Compact();
+    }
+    return total;
 }

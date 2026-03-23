@@ -21,7 +21,7 @@ class TopicManager
     explicit TopicManager(const std::filesystem::path &data_dir, uint64_t max_seg_bytes = kDefaultMaxSegmentBytes);
 
     // Returns err::kOk on success, err::kTopicAlreadyExists if the topic exists.
-    int16_t CreateTopic(std::string_view name, int num_partitions);
+    int16_t CreateTopic(std::string_view name, int num_partitions, CleanupPolicy policy = CleanupPolicy::kDelete);
 
     // Returns nullptr if not found.
     Topic *FindTopic(std::string_view name);
@@ -39,5 +39,6 @@ class TopicManager
 
     mutable std::shared_mutex mu_;
     std::unordered_map<std::string, std::unique_ptr<Topic>> topics_;
-    std::unordered_map<std::string, int> meta_; // name → num_partitions
+    std::unordered_map<std::string, int> meta_;             // name → num_partitions
+    std::unordered_map<std::string, CleanupPolicy> policy_; // name → cleanup policy
 };

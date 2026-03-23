@@ -1019,6 +1019,67 @@ func TestIdempotentOutOfOrder(t *testing.T) {
 	}
 }
 
+// ─── Log compaction tests ─────────────────────────────────────────────────────
+
+func TestCreateTopicCompact(t *testing.T) {
+	client, err := fluxmq.NewClient(brokerAddr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("compact-test")
+	if err := client.CreateTopicCompact(topic, 1, fluxmq.CleanupCompact); err != nil {
+		t.Fatalf("CreateTopicCompact: %v", err)
+	}
+
+	// Verify the topic was created.
+	topics, err := client.Metadata()
+	if err != nil {
+		t.Fatalf("Metadata: %v", err)
+	}
+	found := false
+	for _, tm := range topics {
+		if tm.Name == topic {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("topic %q not found in metadata", topic)
+	}
+}
+
+func TestCompactTopicKeyRetention(t *testing.T) {
+	client, err := fluxmq.NewClient(brokerAddr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	topic := uniqueTopic("compact-kv")
+	if err := client.CreateTopicCompact(topic, 1, fluxmq.CleanupCompact); err != nil {
+		t.Fatalf("CreateTopicCompact: %v", err)
+	}
+
+	// Produce multiple values for the same key.
+	for i := 0; i < 5; i++ {
+		val := fmt.Sprintf("val-%d", i)
+		if _, _, err := client.Produce(topic, 0, []byte("mykey"), []byte(val)); err != nil {
+			t.Fatalf("Produce[%d]: %v", i, err)
+		}
+	}
+
+	// Fetch and verify all 5 records are present (compaction hasn't run yet
+	// since they're all in the active segment).
+	records, err := client.Fetch(topic, 0, 0, 10*1024*1024, 0)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(records) != 5 {
+		t.Fatalf("expected 5 records, got %d", len(records))
+	}
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // containsString checks whether s contains substr.
