@@ -325,6 +325,175 @@ static void test_client_disconnect_mid_frame()
     close(good);
 }
 
+static void test_zero_length_payload()
+{
+    // A request with an empty payload should be handled correctly.
+    EchoServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kMetadata, 42); // no payload
+    auto resp = recv_response(fd);
+
+    CHECK_EQ(resp.correlation_id, static_cast<uint32_t>(42));
+    CHECK_EQ(resp.payload.size(), 0U);
+
+    close(fd);
+}
+
+static void test_rapid_connect_disconnect()
+{
+    // Open and close many connections rapidly. The server must not crash or
+    // leak file descriptors.
+    EchoServer srv;
+
+    for (int i = 0; i < 50; i++) {
+        int fd = connect_to(srv.port);
+        close(fd);
+    }
+
+    // After all the churn, a normal request must still work.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    int fd = connect_to(srv.port);
+    send_request(fd, api::kProduce, 999, {0xDE, 0xAD});
+    auto resp = recv_response(fd);
+    CHECK_EQ(resp.correlation_id, static_cast<uint32_t>(999));
+    CHECK_EQ(resp.payload.size(), 2U);
+    close(fd);
+}
+
+static void test_back_to_back_frames()
+{
+    // Send two complete frames in a single write. The server must parse both
+    // and return two separate responses.
+    EchoServer srv;
+    int fd = connect_to(srv.port);
+
+    auto frame1 = EncodeRequest(RequestFrame{api::kProduce, 0, 100, {0x01}});
+    auto frame2 = EncodeRequest(RequestFrame{api::kFetch, 0, 200, {0x02, 0x03}});
+
+    // Concatenate both frames into one buffer and send in a single write.
+    std::vector<uint8_t> combined;
+    combined.insert(combined.end(), frame1.begin(), frame1.end());
+    combined.insert(combined.end(), frame2.begin(), frame2.end());
+    send_all(fd, combined.data(), combined.size());
+
+    auto resp1 = recv_response(fd);
+    auto resp2 = recv_response(fd);
+
+    CHECK_EQ(resp1.correlation_id, static_cast<uint32_t>(100));
+    CHECK_EQ(resp1.payload.size(), 1U);
+    CHECK_EQ(resp1.payload[0], static_cast<uint8_t>(0x01));
+
+    CHECK_EQ(resp2.correlation_id, static_cast<uint32_t>(200));
+    CHECK_EQ(resp2.payload.size(), 2U);
+    CHECK_EQ(resp2.payload[0], static_cast<uint8_t>(0x02));
+
+    close(fd);
+}
+
+static void test_many_concurrent_connections()
+{
+    // Stress test: 32 connections each sending and receiving concurrently.
+    EchoServer srv;
+
+    const int kConns = 32;
+    int fds[kConns];
+    for (int i = 0; i < kConns; i++)
+        fds[i] = connect_to(srv.port);
+
+    // Each connection sends a unique request.
+    for (int i = 0; i < kConns; i++) {
+        std::vector<uint8_t> payload = {static_cast<uint8_t>(i)};
+        send_request(fds[i], api::kProduce, static_cast<uint32_t>(i), payload);
+    }
+
+    // Read all responses.
+    for (int i = 0; i < kConns; i++) {
+        auto resp = recv_response(fds[i]);
+        CHECK_EQ(resp.correlation_id, static_cast<uint32_t>(i));
+        CHECK_EQ(resp.payload[0], static_cast<uint8_t>(i));
+    }
+
+    for (int i = 0; i < kConns; i++)
+        close(fds[i]);
+}
+
+static void test_interleaved_send_recv()
+{
+    // Interleave sends and receives across two connections to ensure
+    // the server handles concurrent traffic without mixing up responses.
+    EchoServer srv;
+    int fd1 = connect_to(srv.port);
+    int fd2 = connect_to(srv.port);
+
+    for (int round = 0; round < 10; round++) {
+        uint32_t corr1 = static_cast<uint32_t>(round * 2);
+        uint32_t corr2 = static_cast<uint32_t>(round * 2 + 1);
+
+        send_request(fd1, api::kProduce, corr1, {static_cast<uint8_t>(round)});
+        send_request(fd2, api::kFetch, corr2, {static_cast<uint8_t>(round + 100)});
+
+        auto resp1 = recv_response(fd1);
+        auto resp2 = recv_response(fd2);
+
+        CHECK_EQ(resp1.correlation_id, corr1);
+        CHECK_EQ(resp2.correlation_id, corr2);
+        CHECK_EQ(resp1.payload[0], static_cast<uint8_t>(round));
+        CHECK_EQ(resp2.payload[0], static_cast<uint8_t>(round + 100));
+    }
+
+    close(fd1);
+    close(fd2);
+}
+
+static void test_deep_pipeline()
+{
+    // Pipeline 100 requests then drain all 100 responses.
+    EchoServer srv;
+    int fd = connect_to(srv.port);
+
+    const int kDepth = 100;
+    for (int i = 0; i < kDepth; i++) {
+        std::vector<uint8_t> payload(4);
+        EncBe32(payload.data(), static_cast<uint32_t>(i));
+        send_request(fd, api::kProduce, static_cast<uint32_t>(i), payload);
+    }
+    for (int i = 0; i < kDepth; i++) {
+        auto resp = recv_response(fd);
+        CHECK_EQ(resp.correlation_id, static_cast<uint32_t>(i));
+        uint32_t val = DecBe32(resp.payload.data());
+        CHECK_EQ(val, static_cast<uint32_t>(i));
+    }
+
+    close(fd);
+}
+
+static void test_server_stop_while_connected()
+{
+    // Verify server shuts down gracefully even with an active connection.
+    auto echo_handler = [](Connection &conn, RequestFrame frame) {
+        ResponseFrame resp;
+        resp.correlation_id = frame.correlation_id;
+        resp.payload = std::move(frame.payload);
+        conn.SendResponse(resp);
+    };
+
+    Server server{echo_handler};
+    auto thread = std::thread([&server] { server.Run(0); });
+    uint16_t port = server.WaitReady();
+
+    int fd = connect_to(port);
+    send_request(fd, api::kProduce, 1, {0x42});
+    auto resp = recv_response(fd);
+    CHECK_EQ(resp.correlation_id, static_cast<uint32_t>(1));
+
+    // Stop while connection is still open — must not hang or crash.
+    server.Stop();
+    thread.join();
+
+    close(fd);
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main()
@@ -339,6 +508,13 @@ int main()
     RUN_TEST(test_large_payload);
     RUN_TEST(test_multiple_connections);
     RUN_TEST(test_client_disconnect_mid_frame);
+    RUN_TEST(test_zero_length_payload);
+    RUN_TEST(test_rapid_connect_disconnect);
+    RUN_TEST(test_back_to_back_frames);
+    RUN_TEST(test_many_concurrent_connections);
+    RUN_TEST(test_interleaved_send_recv);
+    RUN_TEST(test_deep_pipeline);
+    RUN_TEST(test_server_stop_while_connected);
 
     printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed > 0 ? 1 : 0;

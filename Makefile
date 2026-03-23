@@ -6,6 +6,7 @@ TARGET          := $(BUILD)/fluxmq
 TEST_LOG        := $(BUILD)/test_log
 TEST_SERVER     := $(BUILD)/test_server
 TEST_BROKER     := $(BUILD)/test_broker
+TEST_CHAOS      := $(BUILD)/test_chaos
 
 # ── Source groups ─────────────────────────────────────────────────────────────
 
@@ -61,6 +62,12 @@ $(TEST_BROKER): $(LIB_OBJS) $(BUILD)/test_broker.o | $(BUILD)
 $(BUILD)/test_broker.o: tests/test_broker.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(TEST_CHAOS): $(LIB_OBJS) $(BUILD)/test_chaos.o | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+
+$(BUILD)/test_chaos.o: tests/test_chaos.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # ── Targets ───────────────────────────────────────────────────────────────────
 
 $(BUILD):
@@ -69,10 +76,11 @@ $(BUILD):
 run: $(TARGET)
 	./$(TARGET)
 
-test: $(TEST_LOG) $(TEST_SERVER) $(TEST_BROKER)
+test: $(TEST_LOG) $(TEST_SERVER) $(TEST_BROKER) $(TEST_CHAOS)
 	./$(TEST_LOG)
 	./$(TEST_SERVER)
 	./$(TEST_BROKER)
+	./$(TEST_CHAOS)
 
 # ── Go SDK ────────────────────────────────────────────────────────────────────
 
@@ -98,7 +106,7 @@ sdk-vet:
 
 # ── Auto-generated header dependencies ───────────────────────────────────────
 
-ALL_OBJS := $(MAIN_OBJS) $(BUILD)/test_log.o $(BUILD)/test_server.o $(BUILD)/test_broker.o
+ALL_OBJS := $(MAIN_OBJS) $(BUILD)/test_log.o $(BUILD)/test_server.o $(BUILD)/test_broker.o $(BUILD)/test_chaos.o
 -include $(ALL_OBJS:.o=.d)
 
 # ── Docker ────────────────────────────────────────────────────────────────────

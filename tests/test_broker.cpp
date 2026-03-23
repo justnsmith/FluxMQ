@@ -788,12 +788,598 @@ static void test_consumer_group_three_members()
     close(fd3);
 }
 
+// ─── Additional payload builders ──────────────────────────────────────────────
+
+static std::vector<uint8_t> make_leave_group(const std::string &group, const std::string &member)
+{
+    std::vector<uint8_t> body;
+    BinaryWriter w(body);
+    w.WriteString(group);
+    w.WriteString(member);
+    return body;
+}
+
+// ─── Error handling & edge case tests ─────────────────────────────────────────
+
+static void test_produce_unknown_topic()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kProduce, 1, make_produce("nonexistent", 0, "", "data"));
+    auto [_, payload] = recv_response(fd);
+    CHECK_EQ(read_error(payload), static_cast<int16_t>(3)); // err::kUnknownTopic
+
+    close(fd);
+}
+
+static void test_produce_invalid_partition()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("part-test", 2));
+    recv_response(fd);
+
+    // Partition 99 does not exist (only 0 and 1).
+    send_request(fd, api::kProduce, 2, make_produce("part-test", 99, "", "data"));
+    auto [_, payload] = recv_response(fd);
+    CHECK_EQ(read_error(payload), static_cast<int16_t>(10)); // err::kInvalidPartition
+
+    close(fd);
+}
+
+static void test_fetch_invalid_partition()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("fetch-part", 2));
+    recv_response(fd);
+
+    send_request(fd, api::kFetch, 2, make_fetch("fetch-part", 99, 0, 1024, 0));
+    auto [_, payload] = recv_response(fd);
+    CHECK_EQ(read_error(payload), static_cast<int16_t>(10)); // err::kInvalidPartition
+
+    close(fd);
+}
+
+static void test_unknown_api_key()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    // Send a request with an unknown API key (255).
+    send_request(fd, 255, 1);
+    auto [_, payload] = recv_response(fd);
+    CHECK_EQ(read_error(payload), static_cast<int16_t>(42)); // err::kInvalidRequest
+
+    close(fd);
+}
+
+static void test_empty_key_produce_fetch()
+{
+    // Produce with an empty key but non-empty value, verify roundtrip.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("empty-key", 1));
+    recv_response(fd);
+
+    send_request(fd, api::kProduce, 2, make_produce("empty-key", 0, "", "value-only"));
+    auto [_, payload] = recv_response(fd);
+    auto pr = decode_produce(payload);
+    CHECK_EQ(pr.error, static_cast<int16_t>(0));
+    CHECK_EQ(pr.offset, static_cast<uint64_t>(0));
+
+    // Fetch it back.
+    send_request(fd, api::kFetch, 3, make_fetch("empty-key", 0, 0, 1024, 0));
+    auto [_2, fetch_payload] = recv_response(fd);
+    auto fr = decode_fetch(fetch_payload);
+    CHECK_EQ(fr.error, static_cast<int16_t>(0));
+    CHECK_EQ(fr.records.size(), 1U);
+    CHECK_EQ(fr.records[0].value, std::string("value-only"));
+
+    close(fd);
+}
+
+static void test_large_message_produce_fetch()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("large-msg", 1));
+    recv_response(fd);
+
+    // Produce a 64KB message.
+    std::string big_value(64 * 1024, 'X');
+    send_request(fd, api::kProduce, 2, make_produce("large-msg", 0, "", big_value));
+    auto [_, payload] = recv_response(fd);
+    auto pr = decode_produce(payload);
+    CHECK_EQ(pr.error, static_cast<int16_t>(0));
+
+    // Fetch it back with sufficient max_bytes.
+    send_request(fd, api::kFetch, 3, make_fetch("large-msg", 0, 0, 256 * 1024, 0));
+    auto [_2, fetch_payload] = recv_response(fd);
+    auto fr = decode_fetch(fetch_payload);
+    CHECK_EQ(fr.error, static_cast<int16_t>(0));
+    CHECK_EQ(fr.records.size(), 1U);
+    CHECK_EQ(fr.records[0].value.size(), big_value.size());
+
+    close(fd);
+}
+
+static void test_multiple_topics_isolation()
+{
+    // Data produced to one topic must not leak into another.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("topic-a", 1));
+    recv_response(fd);
+    send_request(fd, api::kCreateTopic, 2, make_create_topic("topic-b", 1));
+    recv_response(fd);
+
+    // Produce to topic-a only.
+    send_request(fd, api::kProduce, 3, make_produce("topic-a", 0, "", "a-data"));
+    recv_response(fd);
+
+    // Fetch from topic-b — must be empty.
+    send_request(fd, api::kFetch, 4, make_fetch("topic-b", 0, 0, 1024, 0));
+    auto [_, payload] = recv_response(fd);
+    auto fr = decode_fetch(payload);
+    CHECK_EQ(fr.error, static_cast<int16_t>(0));
+    CHECK_EQ(fr.records.size(), 0U);
+
+    // Fetch from topic-a — must have the record.
+    send_request(fd, api::kFetch, 5, make_fetch("topic-a", 0, 0, 1024, 0));
+    auto [_2, payload2] = recv_response(fd);
+    auto fr2 = decode_fetch(payload2);
+    CHECK_EQ(fr2.records.size(), 1U);
+    CHECK_EQ(fr2.records[0].value, std::string("a-data"));
+
+    close(fd);
+}
+
+static void test_fetch_beyond_log_end()
+{
+    // Fetching at an offset beyond what's been produced returns 0 records.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("beyond", 1));
+    recv_response(fd);
+
+    send_request(fd, api::kProduce, 2, make_produce("beyond", 0, "", "only-one"));
+    recv_response(fd);
+
+    // Fetch from offset 100 — nothing there.
+    send_request(fd, api::kFetch, 3, make_fetch("beyond", 0, 100, 1024, 0));
+    auto [_, payload] = recv_response(fd);
+    auto fr = decode_fetch(payload);
+    CHECK_EQ(fr.error, static_cast<int16_t>(0));
+    CHECK_EQ(fr.records.size(), 0U);
+
+    close(fd);
+}
+
+static void test_leave_group_basic()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("leave-t", 4));
+    recv_response(fd);
+
+    // Join group.
+    send_request(fd, api::kJoinGroup, 2, make_join_group("lg", "leave-t", "m1"));
+    auto j = decode_join(recv_response(fd).second);
+    CHECK_EQ(j.error, static_cast<int16_t>(0));
+
+    // Sync to stabilize.
+    auto asgn = balanced_assignments({"m1"}, 4);
+    send_request(fd, api::kSyncGroup, 3, make_sync_group("lg", j.gen_id, "m1", asgn));
+    auto s = decode_sync(recv_response(fd).second);
+    CHECK_EQ(s.error, static_cast<int16_t>(0));
+
+    // Leave.
+    send_request(fd, api::kLeaveGroup, 4, make_leave_group("lg", "m1"));
+    auto [_, lp] = recv_response(fd);
+    CHECK_EQ(read_error(lp), static_cast<int16_t>(0)); // err::kOk
+
+    close(fd);
+}
+
+static void test_leave_unknown_group()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kLeaveGroup, 1, make_leave_group("no-such-group", "m1"));
+    auto [_, payload] = recv_response(fd);
+    CHECK_EQ(read_error(payload), static_cast<int16_t>(16)); // err::kGroupNotFound
+
+    close(fd);
+}
+
+static void test_leave_unknown_member()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("leave-m", 2));
+    recv_response(fd);
+
+    // Create group with m1.
+    send_request(fd, api::kJoinGroup, 2, make_join_group("lm", "leave-m", "m1"));
+    recv_response(fd);
+
+    // Try to leave with unknown member.
+    send_request(fd, api::kLeaveGroup, 3, make_leave_group("lm", "ghost"));
+    auto [_, payload] = recv_response(fd);
+    CHECK_EQ(read_error(payload), static_cast<int16_t>(25)); // err::kUnknownMemberId
+
+    close(fd);
+}
+
+static void test_leave_group_triggers_rebalance()
+{
+    // When one of two members leaves, the remaining member should be notified
+    // of a rebalance via kRebalanceInProgress on its next heartbeat.
+    BrokerServer srv;
+    int fd1 = connect_to(srv.port);
+    int fd2 = connect_to(srv.port);
+
+    send_request(fd1, api::kCreateTopic, 1, make_create_topic("leave-reb", 4));
+    recv_response(fd1);
+
+    // C1 joins and stabilizes.
+    send_request(fd1, api::kJoinGroup, 2, make_join_group("lr", "leave-reb", "c1"));
+    auto j1 = decode_join(recv_response(fd1).second);
+    auto a1 = balanced_assignments(j1.members, 4);
+    send_request(fd1, api::kSyncGroup, 3, make_sync_group("lr", j1.gen_id, "c1", a1));
+    decode_sync(recv_response(fd1).second);
+
+    // C2 joins → triggers rebalance.
+    send_request(fd2, api::kJoinGroup, 4, make_join_group("lr", "leave-reb", "c2"));
+    auto j2 = decode_join(recv_response(fd2).second);
+
+    // C1 re-joins.
+    send_request(fd1, api::kHeartbeat, 5, make_heartbeat("lr", 1, "c1"));
+    recv_response(fd1); // kRebalanceInProgress
+    send_request(fd1, api::kJoinGroup, 6, make_join_group("lr", "leave-reb", "c1"));
+    auto j1b = decode_join(recv_response(fd1).second);
+
+    // Sync both.
+    auto a2 = balanced_assignments(j1b.members, 4);
+    send_request(fd1, api::kSyncGroup, 7, make_sync_group("lr", j1b.gen_id, "c1", a2));
+    decode_sync(recv_response(fd1).second);
+    send_request(fd2, api::kSyncGroup, 8, make_sync_group("lr", j1b.gen_id, "c2"));
+    decode_sync(recv_response(fd2).second);
+
+    // Now C2 leaves gracefully.
+    send_request(fd2, api::kLeaveGroup, 9, make_leave_group("lr", "c2"));
+    auto [_, lp] = recv_response(fd2);
+    CHECK_EQ(read_error(lp), static_cast<int16_t>(0));
+
+    // C1's next heartbeat should get kRebalanceInProgress.
+    send_request(fd1, api::kHeartbeat, 10, make_heartbeat("lr", j1b.gen_id, "c1"));
+    auto hb = read_error(recv_response(fd1).second);
+    CHECK_EQ(hb, static_cast<int16_t>(27)); // err::kRebalanceInProgress
+
+    close(fd1);
+    close(fd2);
+}
+
+static void test_heartbeat_wrong_generation()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("hb-gen", 2));
+    recv_response(fd);
+
+    send_request(fd, api::kJoinGroup, 2, make_join_group("hg", "hb-gen", "m1"));
+    auto j = decode_join(recv_response(fd).second);
+    auto a = balanced_assignments(j.members, 2);
+    send_request(fd, api::kSyncGroup, 3, make_sync_group("hg", j.gen_id, "m1", a));
+    decode_sync(recv_response(fd).second);
+
+    // Heartbeat with wrong generation (gen_id + 100).
+    send_request(fd, api::kHeartbeat, 4, make_heartbeat("hg", j.gen_id + 100, "m1"));
+    auto hb = read_error(recv_response(fd).second);
+    CHECK_EQ(hb, static_cast<int16_t>(22)); // err::kIllegalGeneration
+
+    close(fd);
+}
+
+static void test_heartbeat_unknown_member()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("hb-unk", 2));
+    recv_response(fd);
+
+    send_request(fd, api::kJoinGroup, 2, make_join_group("hu", "hb-unk", "m1"));
+    auto j = decode_join(recv_response(fd).second);
+    auto a = balanced_assignments(j.members, 2);
+    send_request(fd, api::kSyncGroup, 3, make_sync_group("hu", j.gen_id, "m1", a));
+    decode_sync(recv_response(fd).second);
+
+    // Heartbeat from an unknown member.
+    send_request(fd, api::kHeartbeat, 4, make_heartbeat("hu", j.gen_id, "ghost"));
+    auto hb = read_error(recv_response(fd).second);
+    CHECK_EQ(hb, static_cast<int16_t>(25)); // err::kUnknownMemberId
+
+    close(fd);
+}
+
+static void test_heartbeat_unknown_group()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kHeartbeat, 1, make_heartbeat("nonexistent-group", 1, "m1"));
+    auto hb = read_error(recv_response(fd).second);
+    CHECK_EQ(hb, static_cast<int16_t>(16)); // err::kGroupNotFound
+
+    close(fd);
+}
+
+static void test_multiple_consumer_groups_same_topic()
+{
+    // Two independent consumer groups on the same topic. Each group's offsets
+    // and membership are isolated.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("shared-topic", 4));
+    recv_response(fd);
+
+    // Produce some data.
+    for (int i = 0; i < 5; i++) {
+        send_request(fd, api::kProduce, static_cast<uint32_t>(10 + i), make_produce("shared-topic", 0, "", "val-" + std::to_string(i)));
+        recv_response(fd);
+    }
+
+    // Group A commits offset 3.
+    send_request(fd, api::kOffsetCommit, 20, make_offset_commit("group-a", "shared-topic", 0, 3));
+    auto [_, oc1] = recv_response(fd);
+    CHECK_EQ(read_error(oc1), static_cast<int16_t>(0));
+
+    // Group B commits offset 1.
+    send_request(fd, api::kOffsetCommit, 21, make_offset_commit("group-b", "shared-topic", 0, 1));
+    auto [_2, oc2] = recv_response(fd);
+    CHECK_EQ(read_error(oc2), static_cast<int16_t>(0));
+
+    // Verify group A's offset is 3.
+    send_request(fd, api::kOffsetFetch, 22, make_offset_fetch("group-a", "shared-topic", 0));
+    auto ofa = decode_offset_fetch(recv_response(fd).second);
+    CHECK_EQ(ofa.offset, static_cast<uint64_t>(3));
+
+    // Verify group B's offset is 1.
+    send_request(fd, api::kOffsetFetch, 23, make_offset_fetch("group-b", "shared-topic", 0));
+    auto ofb = decode_offset_fetch(recv_response(fd).second);
+    CHECK_EQ(ofb.offset, static_cast<uint64_t>(1));
+
+    close(fd);
+}
+
+static void test_produce_multiple_partitions()
+{
+    // Produce to specific partitions and verify data lands in the right place.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("multi-part", 3));
+    recv_response(fd);
+
+    // Write distinct data to each partition.
+    for (int p = 0; p < 3; p++) {
+        send_request(fd, api::kProduce, static_cast<uint32_t>(10 + p), make_produce("multi-part", p, "", "part-" + std::to_string(p)));
+        auto [_, payload] = recv_response(fd);
+        auto pr = decode_produce(payload);
+        CHECK_EQ(pr.error, static_cast<int16_t>(0));
+        CHECK_EQ(pr.partition_id, static_cast<int32_t>(p));
+        CHECK_EQ(pr.offset, static_cast<uint64_t>(0)); // first record in each partition
+    }
+
+    // Fetch from each partition.
+    for (int p = 0; p < 3; p++) {
+        send_request(fd, api::kFetch, static_cast<uint32_t>(20 + p), make_fetch("multi-part", p, 0, 1024, 0));
+        auto [_, payload] = recv_response(fd);
+        auto fr = decode_fetch(payload);
+        CHECK_EQ(fr.error, static_cast<int16_t>(0));
+        CHECK_EQ(fr.records.size(), 1U);
+        CHECK_EQ(fr.records[0].value, std::string("part-" + std::to_string(p)));
+    }
+
+    close(fd);
+}
+
+static void test_high_volume_produce_fetch()
+{
+    // Produce 1000 messages and verify all are fetchable.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("high-vol", 1));
+    recv_response(fd);
+
+    const int N = 1000;
+    for (int i = 0; i < N; i++) {
+        send_request(fd, api::kProduce, static_cast<uint32_t>(i), make_produce("high-vol", 0, "", "msg-" + std::to_string(i)));
+        auto [_, payload] = recv_response(fd);
+        auto pr = decode_produce(payload);
+        CHECK_EQ(pr.error, static_cast<int16_t>(0));
+        CHECK_EQ(pr.offset, static_cast<uint64_t>(i));
+    }
+
+    // Fetch all at once.
+    send_request(fd, api::kFetch, 9999, make_fetch("high-vol", 0, 0, 10 * 1024 * 1024, 0));
+    auto [_, payload] = recv_response(fd);
+    auto fr = decode_fetch(payload);
+    CHECK_EQ(fr.error, static_cast<int16_t>(0));
+    CHECK_EQ(fr.records.size(), static_cast<size_t>(N));
+    CHECK_EQ(fr.records[0].value, std::string("msg-0"));
+    CHECK_EQ(fr.records[N - 1].value, std::string("msg-" + std::to_string(N - 1)));
+
+    close(fd);
+}
+
+static void test_offset_commit_idempotent()
+{
+    // Committing the same offset twice should succeed both times.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("idem", 1));
+    recv_response(fd);
+
+    send_request(fd, api::kOffsetCommit, 2, make_offset_commit("grp", "idem", 0, 5));
+    CHECK_EQ(read_error(recv_response(fd).second), static_cast<int16_t>(0));
+
+    send_request(fd, api::kOffsetCommit, 3, make_offset_commit("grp", "idem", 0, 5));
+    CHECK_EQ(read_error(recv_response(fd).second), static_cast<int16_t>(0));
+
+    send_request(fd, api::kOffsetFetch, 4, make_offset_fetch("grp", "idem", 0));
+    auto of = decode_offset_fetch(recv_response(fd).second);
+    CHECK_EQ(of.offset, static_cast<uint64_t>(5));
+
+    close(fd);
+}
+
+static void test_offset_overwrite()
+{
+    // Committing a higher offset overwrites the previous one.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("overwrite", 1));
+    recv_response(fd);
+
+    send_request(fd, api::kOffsetCommit, 2, make_offset_commit("og", "overwrite", 0, 2));
+    recv_response(fd);
+    send_request(fd, api::kOffsetCommit, 3, make_offset_commit("og", "overwrite", 0, 7));
+    recv_response(fd);
+
+    send_request(fd, api::kOffsetFetch, 4, make_offset_fetch("og", "overwrite", 0));
+    auto of = decode_offset_fetch(recv_response(fd).second);
+    CHECK_EQ(of.offset, static_cast<uint64_t>(7));
+
+    close(fd);
+}
+
+static void test_metadata_multiple_topics()
+{
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("meta-a", 2));
+    recv_response(fd);
+    send_request(fd, api::kCreateTopic, 2, make_create_topic("meta-b", 5));
+    recv_response(fd);
+    send_request(fd, api::kCreateTopic, 3, make_create_topic("meta-c", 1));
+    recv_response(fd);
+
+    send_request(fd, api::kMetadata, 4);
+    auto [_, meta_payload] = recv_response(fd);
+    BinaryReader mr(meta_payload);
+    uint32_t num_topics = mr.ReadU32();
+    CHECK_EQ(num_topics, 3U);
+
+    // Read all topics (sorted by name).
+    std::vector<std::pair<std::string, int32_t>> topics;
+    for (uint32_t i = 0; i < num_topics; i++) {
+        std::string name = mr.ReadString();
+        int32_t np = mr.ReadI32();
+        topics.emplace_back(name, np);
+    }
+
+    // Should be sorted.
+    CHECK_EQ(topics[0].first, std::string("meta-a"));
+    CHECK_EQ(topics[0].second, static_cast<int32_t>(2));
+    CHECK_EQ(topics[1].first, std::string("meta-b"));
+    CHECK_EQ(topics[1].second, static_cast<int32_t>(5));
+    CHECK_EQ(topics[2].first, std::string("meta-c"));
+    CHECK_EQ(topics[2].second, static_cast<int32_t>(1));
+
+    close(fd);
+}
+
+static void test_concurrent_produce_different_partitions()
+{
+    // Two connections produce to different partitions concurrently.
+    BrokerServer srv;
+    int fd1 = connect_to(srv.port);
+    int fd2 = connect_to(srv.port);
+
+    send_request(fd1, api::kCreateTopic, 1, make_create_topic("conc-part", 2));
+    recv_response(fd1);
+
+    const int N = 50;
+    // fd1 → partition 0, fd2 → partition 1
+    for (int i = 0; i < N; i++) {
+        send_request(fd1, api::kProduce, static_cast<uint32_t>(i), make_produce("conc-part", 0, "", "p0-" + std::to_string(i)));
+        send_request(fd2, api::kProduce, static_cast<uint32_t>(i), make_produce("conc-part", 1, "", "p1-" + std::to_string(i)));
+    }
+
+    for (int i = 0; i < N; i++) {
+        auto pr0 = decode_produce(recv_response(fd1).second);
+        CHECK_EQ(pr0.error, static_cast<int16_t>(0));
+        auto pr1 = decode_produce(recv_response(fd2).second);
+        CHECK_EQ(pr1.error, static_cast<int16_t>(0));
+    }
+
+    // Fetch from each partition.
+    send_request(fd1, api::kFetch, 9998, make_fetch("conc-part", 0, 0, 10 * 1024 * 1024, 0));
+    auto fr0 = decode_fetch(recv_response(fd1).second);
+    CHECK_EQ(fr0.records.size(), static_cast<size_t>(N));
+
+    send_request(fd2, api::kFetch, 9999, make_fetch("conc-part", 1, 0, 10 * 1024 * 1024, 0));
+    auto fr1 = decode_fetch(recv_response(fd2).second);
+    CHECK_EQ(fr1.records.size(), static_cast<size_t>(N));
+
+    close(fd1);
+    close(fd2);
+}
+
+static void test_pipelined_produce_fetch()
+{
+    // Pipeline multiple produce requests, then pipeline multiple fetch requests.
+    BrokerServer srv;
+    int fd = connect_to(srv.port);
+
+    send_request(fd, api::kCreateTopic, 1, make_create_topic("pipeline", 1));
+    recv_response(fd);
+
+    const int N = 20;
+    // Pipeline all produces.
+    for (int i = 0; i < N; i++) {
+        send_request(fd, api::kProduce, static_cast<uint32_t>(10 + i), make_produce("pipeline", 0, "", "pipe-" + std::to_string(i)));
+    }
+    // Drain all produce responses.
+    for (int i = 0; i < N; i++) {
+        auto pr = decode_produce(recv_response(fd).second);
+        CHECK_EQ(pr.error, static_cast<int16_t>(0));
+    }
+
+    // Fetch all.
+    send_request(fd, api::kFetch, 999, make_fetch("pipeline", 0, 0, 10 * 1024 * 1024, 0));
+    auto fr = decode_fetch(recv_response(fd).second);
+    CHECK_EQ(fr.records.size(), static_cast<size_t>(N));
+
+    close(fd);
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main()
 {
     printf("=== FluxMQ Broker Tests ===\n\n");
 
+    // Core functionality
     RUN_TEST(test_create_topic_and_metadata);
     RUN_TEST(test_produce_and_fetch_immediate);
     RUN_TEST(test_produce_key_routing);
@@ -804,6 +1390,39 @@ int main()
     RUN_TEST(test_consumer_group_single_member);
     RUN_TEST(test_consumer_group_rebalance);
     RUN_TEST(test_consumer_group_three_members);
+
+    // Error handling & edge cases
+    RUN_TEST(test_produce_unknown_topic);
+    RUN_TEST(test_produce_invalid_partition);
+    RUN_TEST(test_fetch_invalid_partition);
+    RUN_TEST(test_unknown_api_key);
+    RUN_TEST(test_empty_key_produce_fetch);
+    RUN_TEST(test_large_message_produce_fetch);
+    RUN_TEST(test_fetch_beyond_log_end);
+
+    // Topic isolation & metadata
+    RUN_TEST(test_multiple_topics_isolation);
+    RUN_TEST(test_produce_multiple_partitions);
+    RUN_TEST(test_metadata_multiple_topics);
+
+    // Consumer group edge cases
+    RUN_TEST(test_leave_group_basic);
+    RUN_TEST(test_leave_unknown_group);
+    RUN_TEST(test_leave_unknown_member);
+    RUN_TEST(test_leave_group_triggers_rebalance);
+    RUN_TEST(test_heartbeat_wrong_generation);
+    RUN_TEST(test_heartbeat_unknown_member);
+    RUN_TEST(test_heartbeat_unknown_group);
+    RUN_TEST(test_multiple_consumer_groups_same_topic);
+
+    // Offset management
+    RUN_TEST(test_offset_commit_idempotent);
+    RUN_TEST(test_offset_overwrite);
+
+    // Stress & concurrency
+    RUN_TEST(test_high_volume_produce_fetch);
+    RUN_TEST(test_concurrent_produce_different_partitions);
+    RUN_TEST(test_pipelined_produce_fetch);
 
     printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed > 0 ? 1 : 0;
