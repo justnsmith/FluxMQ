@@ -3,12 +3,15 @@ FROM ubuntu:24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
+    cmake \
     make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
-RUN make
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build --target fluxmq -j"$(nproc)" \
+ && ln -sf src/fluxmq build/fluxmq
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM ubuntu:24.04

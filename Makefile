@@ -1,118 +1,75 @@
-CXX      := g++
-CXXFLAGS := -std=c++20 -Wall -Wextra -Iinclude -MMD -MP
+# ─── FluxMQ Makefile ─────────────────────────────────────────────────────────
+# Thin wrapper around CMake and the scripts/ directory.
+# All C++ builds go through CMake; Go builds use `go build` directly.
+
 BUILD    := build
+SDK_DIR  := sdk
+JOBS     := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 
-TARGET          := $(BUILD)/fluxmq
-TEST_LOG        := $(BUILD)/test_log
-TEST_SERVER     := $(BUILD)/test_server
-TEST_BROKER     := $(BUILD)/test_broker
-TEST_CHAOS      := $(BUILD)/test_chaos
+# ── CMake configure + build ─────────────────────────────────────────────────
 
-# ── Source groups ─────────────────────────────────────────────────────────────
+.PHONY: configure
+configure:
+	cmake -S . -B $(BUILD) -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-# Phase 1: storage engine
-STORAGE_SRCS := src/segment.cpp src/log.cpp
+$(BUILD)/src/fluxmq: configure
+	cmake --build $(BUILD) --target fluxmq -j $(JOBS)
 
-# Phase 2: network layer
-NET_SRCS := src/buffer.cpp src/reactor.cpp src/connection.cpp src/server.cpp
+# Keep the old path working — symlink for backward compat with CI / Docker.
+$(BUILD)/fluxmq: $(BUILD)/src/fluxmq
+	ln -sf src/fluxmq $(BUILD)/fluxmq
 
-# Phase 3: broker core
-# Phase 6: replication
-# Phase 7: observability
-BROKER_SRCS := src/partition.cpp src/topic.cpp src/topic_manager.cpp \
-               src/group_coordinator.cpp src/handler.cpp \
-               src/cluster_store.cpp src/replica_client.cpp \
-               src/replication_manager.cpp src/leader_elector.cpp \
-               src/metrics.cpp src/metrics_server.cpp
+# ── Top-level targets ───────────────────────────────────────────────────────
 
-# All library objects (shared by main binary and tests)
-LIB_SRCS := $(STORAGE_SRCS) $(NET_SRCS) $(BROKER_SRCS)
-LIB_OBJS := $(patsubst src/%.cpp,$(BUILD)/%.o,$(LIB_SRCS))
+.PHONY: all
+all: $(BUILD)/fluxmq test-binaries sdk bench
 
-MAIN_OBJS := $(LIB_OBJS) $(BUILD)/main.o
+.PHONY: test-binaries
+test-binaries: configure
+	cmake --build $(BUILD) -j $(JOBS)
 
-# ── Main binary ───────────────────────────────────────────────────────────────
+.PHONY: run
+run: $(BUILD)/fluxmq
+	./$(BUILD)/fluxmq
 
-$(TARGET): $(MAIN_OBJS) | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+.PHONY: test
+test: test-binaries
+	./$(BUILD)/tests/fluxmq_test_log
+	./$(BUILD)/tests/fluxmq_test_server
+	./$(BUILD)/tests/fluxmq_test_broker
+	./$(BUILD)/tests/fluxmq_test_chaos
 
-$(BUILD)/main.o: src/main.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# ── Go SDK ──────────────────────────────────────────────────────────────────
 
-$(BUILD)/%.o: src/%.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+CLI   := $(BUILD)/fluxmq-cli
+BENCH := $(BUILD)/fluxmq-bench
 
-# ── Test binaries ─────────────────────────────────────────────────────────────
-
-$(TEST_LOG): $(LIB_OBJS) $(BUILD)/test_log.o | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
-
-$(BUILD)/test_log.o: tests/test_log.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_SERVER): $(LIB_OBJS) $(BUILD)/test_server.o | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
-
-$(BUILD)/test_server.o: tests/test_server.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_BROKER): $(LIB_OBJS) $(BUILD)/test_broker.o | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
-
-$(BUILD)/test_broker.o: tests/test_broker.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_CHAOS): $(LIB_OBJS) $(BUILD)/test_chaos.o | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
-
-$(BUILD)/test_chaos.o: tests/test_chaos.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# ── Targets ───────────────────────────────────────────────────────────────────
-
-$(BUILD):
-	mkdir -p $(BUILD)
-
-run: $(TARGET)
-	./$(TARGET)
-
-test: $(TEST_LOG) $(TEST_SERVER) $(TEST_BROKER) $(TEST_CHAOS)
-	./$(TEST_LOG)
-	./$(TEST_SERVER)
-	./$(TEST_BROKER)
-	./$(TEST_CHAOS)
-
-# ── Go SDK ────────────────────────────────────────────────────────────────────
-
-CLI         := $(BUILD)/fluxmq-cli
-BENCH       := $(BUILD)/fluxmq-bench
-SDK_DIR     := sdk
-
-$(CLI): $(TARGET) | $(BUILD)
+$(CLI): $(BUILD)/fluxmq
 	cd $(SDK_DIR) && go build -o ../$(CLI) ./cmd/fluxmq
 
-$(BENCH): | $(BUILD)
+$(BENCH):
+	@mkdir -p $(BUILD)
 	cd $(SDK_DIR) && go build -o ../$(BENCH) ./cmd/fluxmq-bench
 
+.PHONY: sdk
 sdk: $(CLI)
 
+.PHONY: bench
 bench: $(BENCH)
 
-sdk-test: $(TARGET)
+.PHONY: sdk-test
+sdk-test: $(BUILD)/fluxmq
 	cd $(SDK_DIR) && go test ./tests/ -timeout 120s
 
+.PHONY: sdk-vet
 sdk-vet:
 	cd $(SDK_DIR) && go vet ./...
 
-# ── Auto-generated header dependencies ───────────────────────────────────────
-
-ALL_OBJS := $(MAIN_OBJS) $(BUILD)/test_log.o $(BUILD)/test_server.o $(BUILD)/test_broker.o $(BUILD)/test_chaos.o
--include $(ALL_OBJS:.o=.d)
-
-# ── Docker ────────────────────────────────────────────────────────────────────
+# ── Docker ──────────────────────────────────────────────────────────────────
 
 DOCKER_IMAGE := fluxmq-broker
 
+.PHONY: docker-build docker-up docker-down docker-logs
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
@@ -125,21 +82,20 @@ docker-down:
 docker-logs:
 	docker compose logs -f
 
-# ── Housekeeping ──────────────────────────────────────────────────────────────
+# ── Housekeeping ────────────────────────────────────────────────────────────
 
+.PHONY: clean
 clean:
 	rm -rf $(BUILD)
 
+.PHONY: lint
 lint:
 	./scripts/lint.sh
 
+.PHONY: format
 format:
 	./scripts/format.sh
 
+.PHONY: format-check
 format-check:
 	./scripts/format.sh --check
-
-.PHONY: run test sdk bench sdk-test sdk-vet \
-        docker-build docker-up docker-down docker-logs \
-        clean lint format format-check
-

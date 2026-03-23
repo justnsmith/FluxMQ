@@ -63,15 +63,28 @@ FluxMQ is a distributed message queue built from scratch in C++20 and Go, inspir
 
 ## Build
 
-Requires g++ (C++20) and Go 1.22+.
+Requires CMake 3.20+, g++/clang++ (C++20), and Go 1.22+.
 
 ```bash
-make            # broker binary → build/fluxmq
+make            # broker binary → build/fluxmq  (CMake under the hood)
+make test       # C++ unit tests (91 tests)
 make sdk        # CLI tool      → build/fluxmq-cli
 make bench      # bench tool    → build/fluxmq-bench
-make test       # C++ unit tests
 make sdk-test   # Go integration tests
 make format-check && make lint
+```
+
+Or use the scripts directly:
+
+```bash
+./scripts/build.sh all              # build everything
+./scripts/build.sh broker --debug   # debug build
+./scripts/test.sh cpp               # C++ tests only
+./scripts/test.sh go                # Go integration tests
+./scripts/check.sh --fix-format     # lint + auto-format
+./scripts/run.sh cluster --build    # start 3-broker local cluster
+./scripts/ci.sh                     # full CI pipeline locally
+./scripts/deploy.sh apply           # deploy to AWS (Terraform)
 ```
 
 ## Running
